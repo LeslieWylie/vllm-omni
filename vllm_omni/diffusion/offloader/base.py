@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -52,6 +52,7 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    dlo_encoder_resident_layers: int = 0  # leading declared encoder layers kept on device
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -122,11 +123,16 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        dlo_encoder_resident_layers = int(getattr(od_config, "dlo_encoder_resident_layers", 0))
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
-        if dlo_resident_layers and dlo_use_allgather:
+        if dlo_encoder_resident_layers < 0:
+            raise ValueError(f"dlo_encoder_resident_layers must be >= 0, got {dlo_encoder_resident_layers}")
+        if dlo_encoder_resident_layers and not enable_distributed_layerwise_offload:
+            raise ValueError("dlo_encoder_resident_layers requires distributed layerwise offload")
+        if (dlo_resident_layers or dlo_encoder_resident_layers) and dlo_use_allgather:
             raise ValueError(
-                "dlo_resident_layers currently requires --dlo-no-use-allgather so "
+                "Resident-layer configuration requires --dlo-no-use-allgather so "
                 "resident blocks use weights prepared by the standard TP-aware loader"
             )
 
@@ -157,6 +163,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_encoder_resident_layers=dlo_encoder_resident_layers,
         )
 
 

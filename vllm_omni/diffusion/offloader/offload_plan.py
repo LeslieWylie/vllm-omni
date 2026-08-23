@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Declarative OffloadPlan for distributed layerwise offload.
 
 Models declare this as a class attribute ``_offload_plan`` on the
@@ -42,6 +42,12 @@ class OffloadPlan:
         encoder_block_attrs: Maps encoder paths to rank-local block-list paths.
             These blocks are streamed with ordinary layerwise hooks, never
             with the DiT AllGather group.
+        resident_encoder_block_paths: Fully qualified encoder block-list paths
+            whose leading blocks may be kept on device when
+            ``dlo_encoder_resident_layers`` is nonzero. The configured count
+            applies independently to every declared path on every rank. Each
+            owning encoder must also be in ``on_demand_component_paths`` and
+            provide the corresponding stage lifecycle.
     """
 
     on_demand_component_paths: frozenset[str] = field(default_factory=frozenset)
@@ -50,6 +56,7 @@ class OffloadPlan:
     offload_submodules: dict[str, str] = field(default_factory=dict)
     resident_dit_paths: frozenset[str] = field(default_factory=frozenset)
     encoder_block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    resident_encoder_block_paths: frozenset[str] = field(default_factory=frozenset)
 
 
 def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:

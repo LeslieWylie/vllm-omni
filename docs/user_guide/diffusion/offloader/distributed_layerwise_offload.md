@@ -36,7 +36,8 @@ vllm serve /path/to/model --omni \
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --data-parallel-size 4 \
-  --dlo-no-use-allgather
+  --dlo-no-use-allgather \
+  --dlo-encoder-resident-layers 32
 
 # Sequence parallel deployment
 vllm serve /path/to/model --omni \
@@ -63,6 +64,7 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--dlo-encoder-resident-layers N` | Keep N leading blocks in every model-declared eligible encoder stack; requires no-AllGather | `0` |
 
 ## Host-weight loading
 
@@ -117,11 +119,33 @@ class MyPipeline(nn.Module):
     _offload_plan = OffloadPlan(
         block_attrs={"transformer": ("blocks",)},
         offload_submodules={"context_encoder": "layers"},
+        encoder_block_attrs={"text_encoder": ("vision.blocks", "text.layers")},
+        resident_encoder_block_paths=frozenset({"text_encoder.text.layers"}),
+        on_demand_component_paths=frozenset({"text_encoder"}),
     )
 ```
 
 When no plan exists, discovery falls back to
 `_layerwise_offload_blocks_attrs` and then heuristic attribute lookup.
+
+Encoder residency is deliberately opt-in at the repeated-stack level. A
+nonzero `dlo_encoder_resident_layers` value applies to every path in
+`resident_encoder_block_paths`: each rank keeps that many leading blocks from
+each eligible stack that is materialized on that rank and streams only its
+suffix. The retained tensors are the ordinary loader's rank-local
+representation, including TP-local shards. Replicated encoders retain one copy
+per DP/SP rank; a model that uses parameter-free encoder stubs outside a
+dedicated encoder group retains layers only on that group (MiniMax-H3 uses the
+first `text_encoder_tp_size` ranks).
+Multiple eligible encoders and stacks use the same per-stack count and one
+shared residency transfer group; encoders with different component-cache
+owners are rejected rather than silently changing cleanup policy.
+Every eligible encoder must also be a pipeline-managed on-demand component
+that implements `load_to_device()` and `offload_to_cpu()`; this keeps the
+resident prefix out of ordinary whole-module device moves.
+Declarations that do not name a streamed encoder stack, resolve to the same
+stack through multiple aliases, name an undiscovered encoder, or contain fewer
+than the requested number of blocks are rejected before hooks are installed.
 
 ## Data-parallel concurrency
 
@@ -144,7 +168,7 @@ must enter each collective.
   online quantization methods require no-AllGather until their runtime layouts
   are validated.
 - Resident leading layers require `--dlo-no-use-allgather` and a model
-  `OffloadPlan` that declares eligible `resident_dit_paths`.
+  `OffloadPlan` that declares eligible DiT or encoder block paths.
 - DP concurrency requires an explicit, identical inference-step count.
 
 Sharing transformed TP or quantized runtime layouts through a normalized mmap

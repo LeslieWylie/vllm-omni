@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -728,6 +731,13 @@ class OmniServeCommand(CLISubcommand):
             default=0,
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-encoder-resident-layers",
+            type=int,
+            default=0,
+            help="Keep this many leading blocks resident in every model-declared "
+            "eligible encoder stack while DLO streams the remaining blocks.",
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

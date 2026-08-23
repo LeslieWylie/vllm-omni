@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import sys
@@ -436,6 +436,7 @@ def test_dlo_offload_plan_includes_token_refiner():
 
     assert MiniMaxH3Pipeline._offload_plan.offload_submodules == {"token_refiner": "blocks"}
     assert MiniMaxH3Pipeline._offload_plan.resident_dit_paths == frozenset({"transformer"})
+    assert MiniMaxH3Pipeline._offload_plan.resident_encoder_block_paths == frozenset({"text_encoder.text_model.layers"})
 
 
 def test_joint_postprocess_is_multiprocessing_picklable():
@@ -1689,8 +1690,10 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs))
-        or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe)),
+        lambda command, **kwargs: (
+            calls.append((command, kwargs))
+            or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe))
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")

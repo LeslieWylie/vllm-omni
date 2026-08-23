@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Distributed Layerwise Offload backend with double-buffered H2D.
 
 This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
@@ -18,7 +18,9 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import chain
+from operator import attrgetter
 from typing import Any
 
 import torch
@@ -34,7 +36,13 @@ from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import get_blocks_from_dit
-from .module_collector import ModuleDiscovery
+from .layerwise_backend import (
+    LayerwiseOffloadHook,
+    apply_block_hook,
+    remove_block_hook,
+)
+from .module_collector import ModuleDiscovery, PipelineModules
+from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import (
     OffloadPlan,
     get_offload_plan,
@@ -43,6 +51,7 @@ from .tensor_utils import (
     dtype_size as _dtype_size,
 )
 from .tensor_utils import (
+    is_dtensor,
     is_materialized_tensor,
     make_offload_placeholder,
     set_tensor_storage,
@@ -55,6 +64,14 @@ logger = init_logger(__name__)
 # module.  Submodules larger than this are offloaded to save HBM; smaller
 # ones stay resident for lower latency.
 _ON_DEMAND_THRESHOLD_MB = 1024
+
+
+@dataclass
+class _EncoderOffloadState:
+    module: nn.Module
+    hooks: list[LayerwiseOffloadHook]
+    streamed_groups: list[list[nn.Module]]
+    resident_groups: list[list[nn.Module]]
 
 
 class DistributedLayerwiseOffloadHook(ModelHook):
@@ -899,6 +916,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
+        self._encoder_offload_states: list[_EncoderOffloadState] = []
+        self._resident_encoder_blocks: list[nn.Module] = []
+        self._resident_encoder_stager: PinnedModuleStager | None = None
+        self._resident_encoder_cache: BoundedAllocatorCache | None = None
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self.host_weight_plan = host_weight_plan
@@ -1171,55 +1192,355 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         module.to(self.device)
         logger.info("Moved %s (%s) to GPU (resident)", label, module.__class__.__name__)
 
+    @staticmethod
+    def _resolve_encoder_stacks(
+        encoders: dict[str, nn.Module],
+        declared: dict[str, tuple[str, str]],
+    ) -> dict[str, nn.ModuleList]:
+        resolved: dict[str, nn.ModuleList] = {}
+        for full_path, (encoder_name, block_path) in declared.items():
+            encoder = encoders.get(encoder_name)
+            if encoder is None or getattr(encoder, "is_loaded", True) is False:
+                continue
+            try:
+                blocks = attrgetter(block_path)(encoder)
+            except AttributeError as exc:
+                raise ValueError(f"encoder block path {full_path!r} does not exist") from exc
+            if not isinstance(blocks, nn.ModuleList):
+                raise ValueError(
+                    f"encoder block path {full_path!r} must resolve to nn.ModuleList, got {type(blocks).__name__}"
+                )
+            resolved[full_path] = blocks
+        return resolved
+
+    @staticmethod
+    def _validate_encoder_storage_boundary(
+        encoders: dict[str, nn.Module],
+        resolved_stacks: dict[str, nn.ModuleList],
+        resident_paths: frozenset[str],
+        resident_blocks: list[nn.Module],
+        budget: int,
+    ) -> None:
+        streamed_blocks = [
+            block
+            for full_path, blocks in resolved_stacks.items()
+            for block in (blocks[budget:] if full_path in resident_paths else blocks)
+        ]
+
+        resident_module_ids = {id(submodule) for block in resident_blocks for submodule in block.modules()}
+        streamed_module_ids = {id(submodule) for block in streamed_blocks for submodule in block.modules()}
+        if resident_module_ids.intersection(streamed_module_ids):
+            raise ValueError("an encoder module is declared in both resident and streamed stacks")
+        resident_storages: set[tuple[Any, ...]] = set()
+        other_storages: set[tuple[Any, ...]] = set()
+        for encoder in encoders.values():
+            if getattr(encoder, "is_loaded", True) is False:
+                continue
+            for submodule in encoder.modules():
+                destination = resident_storages if id(submodule) in resident_module_ids else other_storages
+                for target in chain(submodule._parameters.values(), submodule._buffers.values()):
+                    if target is None:
+                        continue
+                    local = target.to_local() if is_dtensor(target) else target
+                    if local.is_meta:
+                        raise ValueError("resident encoder validation encountered a meta tensor")
+                    storage = local.untyped_storage()
+                    if storage.nbytes() == 0:
+                        continue
+                    destination.add(
+                        (
+                            local.device.type,
+                            local.device.index,
+                            storage.data_ptr(),
+                            storage.nbytes(),
+                        )
+                    )
+        if resident_storages.intersection(other_storages):
+            raise ValueError("encoder storage aliases cross the resident/streamed boundary")
+
+    def _validate_encoder_residency_plan(self, modules: PipelineModules, plan: OffloadPlan | None) -> None:
+        """Validate the complete model declaration before mutating encoder storage."""
+        budget = self.config.dlo_encoder_resident_layers
+        if budget == 0:
+            return
+        if plan is None or not plan.resident_encoder_block_paths:
+            raise ValueError(
+                f"dlo_encoder_resident_layers={budget} was requested, but this model "
+                "declares no resident_encoder_block_paths"
+            )
+
+        declared: dict[str, tuple[str, str]] = {}
+        ambiguous: set[str] = set()
+        for encoder_name, block_paths in plan.encoder_block_attrs.items():
+            for block_path in block_paths:
+                full_path = f"{encoder_name}.{block_path}"
+                if full_path in declared:
+                    ambiguous.add(full_path)
+                declared[full_path] = (encoder_name, block_path)
+        if ambiguous:
+            raise ValueError(f"OffloadPlan has ambiguous encoder block paths: {sorted(ambiguous)}")
+
+        unsupported = plan.resident_encoder_block_paths.difference(declared)
+        if unsupported:
+            raise ValueError(
+                "resident_encoder_block_paths must also be declared in "
+                f"encoder_block_attrs; unsupported paths: {sorted(unsupported)}"
+            )
+
+        encoders = dict(zip(modules.encoder_names, modules.encoders, strict=True))
+        missing_encoders = sorted(
+            {declared[path][0] for path in plan.resident_encoder_block_paths}.difference(encoders)
+        )
+        if missing_encoders:
+            raise ValueError(f"resident encoder declarations were not discovered in the pipeline: {missing_encoders}")
+        resident_encoder_names = {declared[path][0] for path in plan.resident_encoder_block_paths}
+        unmanaged_encoders = sorted(resident_encoder_names.difference(plan.on_demand_component_paths))
+        if unmanaged_encoders:
+            raise ValueError(
+                "resident encoders must declare pipeline-managed stage ownership in "
+                f"on_demand_component_paths: {unmanaged_encoders}"
+            )
+        for encoder_name in resident_encoder_names:
+            encoder = encoders[encoder_name]
+            if not callable(getattr(encoder, "load_to_device", None)) or not callable(
+                getattr(encoder, "offload_to_cpu", None)
+            ):
+                raise ValueError(
+                    f"resident encoder {encoder_name!r} must implement load_to_device() and offload_to_cpu()"
+                )
+
+        resolved_stacks = self._resolve_encoder_stacks(encoders, declared)
+
+        seen_stacks: dict[int, str] = {}
+        seen_blocks: dict[int, str] = {}
+        resident_blocks: list[nn.Module] = []
+        caches: dict[int, BoundedAllocatorCache] = {}
+        for full_path in sorted(plan.resident_encoder_block_paths):
+            encoder_name, _ = declared[full_path]
+            encoder = encoders[encoder_name]
+            # Distributed pipelines may construct a parameter-free encoder
+            # stub on ranks outside the model-owned encoder group. Those
+            # ranks have no storage to retain and are valid non-consumers of
+            # the otherwise global OffloadPlan declaration.
+            if getattr(encoder, "is_loaded", True) is False:
+                continue
+            blocks = resolved_stacks[full_path]
+            if budget > len(blocks):
+                raise ValueError(
+                    f"dlo_encoder_resident_layers={budget} exceeds the {len(blocks)} blocks declared by {full_path}"
+                )
+            previous = seen_stacks.setdefault(id(blocks), full_path)
+            if previous != full_path:
+                raise ValueError(
+                    f"resident encoder declarations resolve to the same block stack: {previous!r} and {full_path!r}"
+                )
+            local_blocks: set[int] = set()
+            for block in blocks:
+                if id(block) in local_blocks:
+                    raise ValueError(f"resident encoder stack {full_path!r} repeats one block instance")
+                local_blocks.add(id(block))
+                previous_block_path = seen_blocks.setdefault(id(block), full_path)
+                if previous_block_path != full_path:
+                    raise ValueError(
+                        f"resident encoder block stacks overlap: {previous_block_path!r} and {full_path!r}"
+                    )
+            resident_blocks.extend(blocks[:budget])
+            cache = getattr(encoder, "_omni_component_cache", None)
+            if cache is not None:
+                caches[id(cache)] = cache
+
+        self._validate_encoder_storage_boundary(
+            encoders,
+            resolved_stacks,
+            plan.resident_encoder_block_paths,
+            resident_blocks,
+            budget,
+        )
+
+        if len(caches) > 1:
+            raise ValueError(
+                "resident encoder stacks use different component-cache owners; "
+                "a shared residency group requires one cache policy"
+            )
+        self._resident_encoder_cache = next(iter(caches.values()), None)
+
+    @staticmethod
+    def _encoder_hook_group(
+        blocks: list[nn.Module],
+        device: torch.device,
+        copy_stream: Any,
+        pin_memory: bool,
+    ) -> list[LayerwiseOffloadHook]:
+        if len(blocks) == 1:
+            hook = apply_block_hook(blocks[0], blocks[0], device, copy_stream, pin_memory)
+            hook._prev_hook = hook
+            return [hook]
+
+        hooks = [apply_block_hook(blocks[-1], blocks[0], device, copy_stream, pin_memory)]
+        hooks.extend(
+            apply_block_hook(block, blocks[index + 1], device, copy_stream, pin_memory)
+            for index, block in enumerate(blocks[:-1])
+        )
+        for index, hook in enumerate(hooks):
+            hook._prev_hook = hooks[index - 1]
+        return hooks
+
     def _try_layerwise_offload_encoder(self, module: nn.Module, name: str, plan: OffloadPlan | None) -> bool:
         """Stream plan-declared encoder blocks on each rank without AllGather."""
         if plan is None or name not in plan.encoder_block_attrs:
             return False
+        if getattr(module, "is_loaded", True) is False:
+            return False
         if getattr(module, "_omni_layerwise_enabled", False):
             return True
 
-        from operator import attrgetter
-
-        from vllm_omni.diffusion.offloader.layerwise_backend import apply_block_hook
-
-        hooks = []
-        block_groups = []
+        hooks: list[LayerwiseOffloadHook] = []
+        streamed_groups: list[list[nn.Module]] = []
+        resident_groups: list[list[nn.Module]] = []
+        resident_start = len(self._resident_encoder_blocks)
         copy_stream = current_omni_platform.Stream()
-        for block_path in plan.encoder_block_attrs[name]:
-            try:
-                blocks = attrgetter(block_path)(module)
-            except AttributeError:
-                logger.warning("Encoder offload path %s.%s was not found", name, block_path)
-                continue
-            if not isinstance(blocks, nn.ModuleList) or len(blocks) <= 1:
-                logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
-                continue
-            group_hooks = [
-                apply_block_hook(blocks[-1], blocks[0], self.device, copy_stream, self.config.pin_cpu_memory)
-            ]
-            group_hooks.extend(
-                apply_block_hook(block, blocks[index + 1], self.device, copy_stream, self.config.pin_cpu_memory)
-                for index, block in enumerate(blocks[:-1])
-            )
-            for index, hook in enumerate(group_hooks):
-                hook._prev_hook = group_hooks[index - 1]
-            hooks.extend(group_hooks)
-            block_groups.append(blocks)
+        try:
+            for block_path in plan.encoder_block_attrs[name]:
+                try:
+                    blocks = attrgetter(block_path)(module)
+                except AttributeError:
+                    logger.warning("Encoder offload path %s.%s was not found", name, block_path)
+                    continue
+                if not isinstance(blocks, nn.ModuleList):
+                    logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
+                    continue
 
-        if not hooks:
+                full_path = f"{name}.{block_path}"
+                resident_count = (
+                    self.config.dlo_encoder_resident_layers if full_path in plan.resident_encoder_block_paths else 0
+                )
+                if len(blocks) <= 1 and resident_count == 0:
+                    logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
+                    continue
+                resident_blocks = list(blocks[:resident_count])
+                streamed_blocks = list(blocks[resident_count:])
+                if resident_blocks:
+                    resident_groups.append(resident_blocks)
+                    self._resident_encoder_blocks.extend(resident_blocks)
+                if streamed_blocks:
+                    streamed_groups.append(streamed_blocks)
+                    group_hooks = self._encoder_hook_group(
+                        streamed_blocks,
+                        self.device,
+                        copy_stream,
+                        self.config.pin_cpu_memory,
+                    )
+                    hooks.extend(group_hooks)
+        except BaseException:
+            for hook in hooks:
+                hook.restore_next_layer_to_cpu()
+            for blocks in streamed_groups:
+                for block in blocks:
+                    remove_block_hook(block)
+            del self._resident_encoder_blocks[resident_start:]
+            raise
+
+        if not hooks and not resident_groups:
             return False
         # The component lifecycle uses these generic attributes to keep only
         # non-block encoder state resident during the encode phase.
         module._omni_layerwise_hooks = hooks
-        module._omni_layerwise_block_groups = block_groups
+        module._omni_layerwise_block_groups = streamed_groups
+        module._omni_resident_block_groups = resident_groups
+        module._omni_layerwise_pin_memory = self.config.pin_cpu_memory
         module._omni_layerwise_enabled = True
+        self._encoder_offload_states.append(
+            _EncoderOffloadState(
+                module=module,
+                hooks=hooks,
+                streamed_groups=streamed_groups,
+                resident_groups=resident_groups,
+            )
+        )
         logger.info(
-            "Enabled rank-local layerwise offload for encoder %s (%d blocks across %d stacks)",
+            "Enabled rank-local encoder offload for %s: %d resident and %d streamed blocks",
             name,
-            sum(len(blocks) for blocks in block_groups),
-            len(block_groups),
+            sum(len(blocks) for blocks in resident_groups),
+            sum(len(blocks) for blocks in streamed_groups),
         )
         return True
+
+    def _load_resident_encoder_layers(self) -> None:
+        if not self._resident_encoder_blocks:
+            return
+        stager = PinnedModuleStager(
+            self._resident_encoder_blocks,
+            self.device,
+            pin_memory=self.config.pin_cpu_memory,
+            copy_stream=self.copy_stream,
+            cache_retention=self._resident_encoder_cache,
+        )
+        stager.load()
+        self._resident_encoder_stager = stager
+        for state in self._encoder_offload_states:
+            if state.resident_groups:
+                state.module._omni_encoder_resident_stager = stager
+        logger.info(
+            "Kept %d leading encoder blocks resident across %d declared stacks",
+            len(self._resident_encoder_blocks),
+            sum(len(state.resident_groups) for state in self._encoder_offload_states),
+        )
+
+    def _cleanup_encoder_offload(self, *, force_cache_release: bool = False) -> None:
+        cleanup_error: BaseException | None = None
+        try:
+            current_omni_platform.synchronize()
+        except BaseException as exc:
+            cleanup_error = exc
+        for state in reversed(self._encoder_offload_states):
+            for hook in state.hooks:
+                try:
+                    hook.offload_layer()
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            non_block_stager = getattr(state.module, "_omni_non_block_stager", None)
+            if non_block_stager is not None and non_block_stager.loaded:
+                try:
+                    non_block_stager.offload()
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+
+        stager = self._resident_encoder_stager
+        if stager is not None:
+            try:
+                stager.offload()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        self._resident_encoder_stager = None
+
+        for state in reversed(self._encoder_offload_states):
+            for hook in state.hooks:
+                try:
+                    hook.restore_next_layer_to_cpu()
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            for blocks in state.streamed_groups:
+                for block in blocks:
+                    remove_block_hook(block)
+            state.module._omni_layerwise_hooks = []
+            state.module._omni_layerwise_block_groups = []
+            state.module._omni_resident_block_groups = []
+            state.module._omni_layerwise_enabled = False
+            if hasattr(state.module, "_omni_layerwise_pin_memory"):
+                del state.module._omni_layerwise_pin_memory
+            if hasattr(state.module, "_omni_encoder_resident_stager"):
+                del state.module._omni_encoder_resident_stager
+
+        self._encoder_offload_states.clear()
+        self._resident_encoder_blocks.clear()
+        if force_cache_release and self._resident_encoder_cache is not None:
+            try:
+                self._resident_encoder_cache.release_if_needed(force=True)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        self._resident_encoder_cache = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _try_layerwise_offload_submodule(self, module: nn.Module, name: str, plan: OffloadPlan | None = None) -> bool:
         """Try to apply layerwise offload to a large submodule's blocks.
@@ -1405,6 +1726,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 buffer.data = buffer.data.to(self.device, non_blocking=True)
 
     def enable(self, pipeline: nn.Module) -> None:
+        try:
+            self._enable(pipeline)
+        except BaseException:
+            try:
+                self._cleanup_encoder_offload(force_cache_release=True)
+            except Exception:
+                logger.exception("Failed to clean up encoder residency after DLO startup failure")
+            raise
+
+    def _enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
@@ -1428,6 +1759,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Retrieve optional declarative OffloadPlan from the pipeline.
         # When present, replaces heuristic block discovery.
         plan = get_offload_plan(pipeline)
+        self._validate_encoder_residency_plan(modules, plan)
 
         if self.config.dlo_resident_layers and (plan is None or not plan.resident_dit_paths):
             logger.warning(
@@ -1475,8 +1807,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
         # during the DiT forward pass.  They are only needed briefly for
         # text-encoding (before DiT) and VAE-decode (after DiT).
-        for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+        for enc, enc_name in zip(modules.encoders, modules.encoder_names, strict=True):
             self._try_layerwise_offload_encoder(enc, enc_name, plan)
+        self._load_resident_encoder_layers()
+        for enc, enc_name in zip(modules.encoders, modules.encoder_names, strict=True):
             self._register_on_demand_hook(
                 enc, "encoder", stage_on_demand=plan is not None and enc_name in plan.on_demand_component_paths
             )
@@ -1743,7 +2077,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def disable(self) -> None:
-        if not self.enabled and not hasattr(self, "_mmap_file_cache"):
+        if (
+            not self.enabled
+            and not hasattr(self, "_mmap_file_cache")
+            and not self._encoder_offload_states
+            and self._resident_encoder_stager is None
+        ):
             return
 
         if self._using_rank_local_mmap:
@@ -1758,6 +2097,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._on_demand_handles = []
         self._on_demand_shard_infos = []
 
+        self._cleanup_encoder_offload()
         self.offload_resident_layers()
         self._blocks.clear()
         self._all_hook_groups.clear()

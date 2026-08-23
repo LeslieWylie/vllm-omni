@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from itertools import chain
@@ -264,14 +264,52 @@ class LayerwiseOffloadHook(ModelHook):
         for _, buf in self.block_buffers.items():
             LayerwiseOffloadHook._set_tensor_storage(buf, LayerwiseOffloadHook._make_offload_placeholder(buf))
 
+    def restore_next_layer_to_cpu(self) -> None:
+        """Rebind the next block to its immutable CPU backing.
+
+        Hook removal normally happens only during process teardown, where empty
+        placeholders are sufficient. Encoder residency supports disable and
+        re-enable on the same model instance, so its streamed suffix must be a
+        complete CPU module again before the hook that owns the CPU backing is
+        discarded.
+        """
+        evt = self._prefetch_done
+        if evt is not None:
+            current_omni_platform.current_stream().wait_event(evt)
+        self._prefetch_done = None
+
+        for dtype, ordered_metadata in self.dtype_metadata.items():
+            cpu_weight = self.dtype_cpu_flattened_weights[dtype]
+            for metadata in ordered_metadata:
+                target_name = metadata["name"]
+                target = (
+                    self.next_block_parameters[target_name]
+                    if target_name in self.next_block_parameters
+                    else self.next_block_buffers[target_name]
+                )
+                LayerwiseOffloadHook._set_tensor_storage(
+                    target,
+                    torch.as_strided(
+                        cpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]],
+                        size=metadata["shape"],
+                        stride=metadata["stride"],
+                    ),
+                )
+
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,
         # (e.g. by cache-dit block caching), ask the previous hook to
         # synchronously prefetch *this* block's weights before computation
-        if not self.is_materialized and self._prev_hook is not None:
-            self._prev_hook.prefetch_layer(non_blocking=False)
+        self_cycle = self.next_block is module
+        if not self.is_materialized:
+            producer = self if self_cycle else self._prev_hook
+            if producer is not None:
+                producer.prefetch_layer(non_blocking=False)
 
-        self.prefetch_layer(non_blocking=True)
+        # A one-block suffix streams itself at each invocation. There is no
+        # distinct next block whose copy can overlap this block's compute.
+        if not self_cycle:
+            self.prefetch_layer(non_blocking=True)
 
         return args, kwargs
 

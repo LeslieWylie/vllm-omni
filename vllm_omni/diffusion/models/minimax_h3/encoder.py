@@ -1219,7 +1219,13 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             stager = getattr(self, "_omni_non_block_stager", None)
             if stager is None:
                 hooks = getattr(self, "_omni_layerwise_hooks", ())
-                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                pin_memory = bool(
+                    getattr(
+                        self,
+                        "_omni_layerwise_pin_memory",
+                        getattr(hooks[0], "pin_memory", True) if hooks else True,
+                    )
+                )
                 stager = PinnedModuleStager(
                     self._omni_non_block_modules(),
                     self.device_target,

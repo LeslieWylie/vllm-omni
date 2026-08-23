@@ -20,7 +20,7 @@ implemented but has less end-to-end coverage than the primary path.
 Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsupported.
 
 | Feature | DLO + AllGather | DLO without AllGather |
-|---|---|---|
+| --- | --- | --- |
 | **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
 | **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
@@ -172,7 +172,7 @@ This mode means:
 ## Parallelism compatibility
 
 | Parallelism | DLO + AllGather | DLO without AllGather |
-|---|---|---|
+| --- | --- | --- |
 | **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages on each node; fallback runtime tensors remain private. |
 | **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active, but DLO keeps standard-loader rank-local weights and adds no SP weight collective. |
 | **TP > 1** | Outside the Phase A shared-mmap support scope. The loader falls back before mutation, preserves TP-local layouts, and DLO may apply DP/SP host sharding to those ordinary runtime tensors. | Outside the Phase A shared-mmap support scope. The ordinary TP-aware loader produces rank-local tensors, which DLO streams without an additional weight collective; DP replicas retain private runtime storage. |
@@ -191,6 +191,30 @@ This mode means:
   materialization and synchronization.
 - **HSDP + DP or TP:** rejected independently by the diffusion parallel
   configuration.
+
+### Encoder residency contract
+
+`dlo_encoder_resident_layers=N` applies `N` independently to every
+model-declared path in `OffloadPlan.resident_encoder_block_paths`. Each path
+must also appear in `encoder_block_attrs`, and its encoder must be a
+pipeline-managed `on_demand_component_paths` owner with `load_to_device()` and
+`offload_to_cpu()` lifecycle methods. This makes the model, rather than the
+generic backend, responsible for identifying eligible repeated stacks.
+
+The backend snapshots every resident prefix into one immutable storage-aware
+stager, materializes the loader-produced rank-local representation once, and
+installs ordinary layerwise hooks only on each suffix. TP shards therefore stay
+TP-local; parameter-free encoder stubs outside a model-owned encoder group
+retain nothing. Shared strides, dtype views, aliases, and DTensor-local
+bindings are preserved inside the resident group. A plan that aliases storage
+or modules across the resident/streamed boundary is rejected before hook
+installation because two storage owners could not preserve that relationship.
+
+Resident prefixes survive request success and failure and are released only
+when DLO is disabled or torn down. Disable restores streamed suffixes to their
+CPU masters before removing hooks, so the same model can be enabled again.
+Nonzero encoder residency is rejected with DLO AllGather; no-AllGather is what
+preserves the ordinary loader's TP-aware rank-local layout.
 
 ## Request and loading constraints
 
@@ -243,7 +267,7 @@ VAEs at TP1. They validate the ordinary-loader fallback only, not direct mmap
 or shared-mmap host-memory savings.
 
 | Configuration | Result | Warm E2E | Peak device memory | Host PSS |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | DP4xTP1 AllGather | Passed, 4 concurrent requests | 2.87 s / 4 requests | 13.84 GiB | 211.99 GiB |
 | DP4xTP1 no-AllGather | Passed, 1 request | 15.02 s | 13.23 GiB | 187.77 GiB |
 | DP2xTP2 AllGather | Passed, 2 concurrent requests | 4.16 s / 2 requests | 12.50 GiB | 211.97 GiB |
@@ -275,7 +299,7 @@ pipeline components, so each worker should be compared with the same worker in
 the other storage mode.
 
 | Worker | Ordinary RSS | mmap RSS | Ordinary PSS | mmap PSS | PSS reduction |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | DP worker 0 | 168.27 GiB | 132.76 GiB | 167.84 GiB | 101.43 GiB | 66.40 GiB |
 | DP worker 1 | 116.19 GiB | 79.97 GiB | 115.73 GiB | 48.64 GiB | 67.09 GiB |
 | **Two-worker total** | — | — | **283.56 GiB** | **150.08 GiB** | **133.48 GiB (47.1%)** |

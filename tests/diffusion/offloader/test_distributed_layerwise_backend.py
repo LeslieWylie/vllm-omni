@@ -680,6 +680,28 @@ class TestPinnedModuleStager:
         assert torch.equal(module.bias, expected_bias)
         stager.offload()
 
+    def test_preserves_dtensor_rank_local_layout(self, dist_group, patched_offload_runtime):
+        module = TinyBlock(_make_values(3.0))
+        expected = module.weight.to_local().clone()
+        mesh = module.weight.device_mesh
+        placements = module.weight.placements
+        stager = PinnedModuleStager(
+            module,
+            torch.device("cpu"),
+            pin_memory=False,
+            copy_stream=DummyStream(),
+        )
+
+        stager.load()
+
+        assert isinstance(module.weight, DTensor)
+        assert module.weight.device_mesh is mesh
+        assert module.weight.placements == placements
+        assert module.weight.to_local().shape == expected.shape
+        assert module.weight.to_local().stride() == expected.stride()
+        assert torch.equal(module.weight.to_local(), expected)
+        stager.offload()
+
 
 class _DummyBlock(nn.Module):
     def __init__(self):
@@ -1032,6 +1054,8 @@ class TestOffloadPlan:
             block_attrs={"transformer": ("gen_layers",)},
             offload_submodules={"context_encoder": "layers"},
             resident_dit_paths=frozenset({"transformer"}),
+            encoder_block_attrs={"text_encoder": ("model.layers",)},
+            resident_encoder_block_paths=frozenset({"text_encoder.model.layers"}),
         )
 
         class PipelineWithPlan(nn.Module):
@@ -1043,6 +1067,8 @@ class TestOffloadPlan:
         assert result.block_attrs == {"transformer": ("gen_layers",)}
         assert result.offload_submodules == {"context_encoder": "layers"}
         assert result.resident_dit_paths == frozenset({"transformer"})
+        assert result.encoder_block_attrs == {"text_encoder": ("model.layers",)}
+        assert result.resident_encoder_block_paths == frozenset({"text_encoder.model.layers"})
 
     def test_offload_plan_defaults_to_empty(self):
         """OffloadPlan with no arguments should have empty dicts."""
@@ -1050,6 +1076,8 @@ class TestOffloadPlan:
         assert plan.block_attrs == {}
         assert plan.offload_submodules == {}
         assert plan.resident_dit_paths == frozenset()
+        assert plan.encoder_block_attrs == {}
+        assert plan.resident_encoder_block_paths == frozenset()
 
     def test_offload_plan_is_frozen(self):
         """OffloadPlan should be immutable (frozen=True)."""

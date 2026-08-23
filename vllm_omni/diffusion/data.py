@@ -1,6 +1,6 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import copy
 import math
 import os
@@ -761,6 +761,8 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Leading blocks in each model-declared eligible encoder stack kept resident.
+    dlo_encoder_resident_layers: int = 0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
