@@ -5,13 +5,16 @@
 These verify the artifact parsing, plan math, head-bank fusion, and trunk
 LoRA key remapping without requiring a GPU or an instantiated pipeline. Run:
 
-    /mnt/data/venvs/h3-vllm-omni/bin/python -m pytest \\
-        tests/diffusion/models/minimax_h3/test_minimax_h3_pdd.py -q
+    pytest tests/diffusion/models/minimax_h3/test_minimax_h3_pdd.py -q
+
+The handful of tests that load a real PDD artifact skip automatically unless
+``MINIMAX_H3_PDD_LORA_DIR`` points at a directory containing the released
+``MiniMax-H3-{Ref2VA,FL2VA}-Acc-8Step.safetensors`` files.
 """
 
 from __future__ import annotations
 
-import sys
+import os
 from pathlib import Path
 
 import inspect
@@ -20,10 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-REPO = Path("/mnt/data/src/vllm-omni-h3")
-sys.path.insert(0, str(REPO))
-
-from vllm_omni.diffusion.models.minimax_h3.pdd import (  # noqa: E402
+from vllm_omni.diffusion.models.minimax_h3.pdd import (
     PDDAdapter,
     PDDConfig,
     PDDParallelHead,
@@ -32,15 +32,15 @@ from vllm_omni.diffusion.models.minimax_h3.pdd import (  # noqa: E402
     _validate_and_convert_tensors,
     load_minimax_h3_pdd_lora,
 )
-from vllm_omni.diffusion.models.minimax_h3.time_request import (  # noqa: E402
+from vllm_omni.diffusion.models.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
-from vllm_omni.lora.request import LoRARequest  # noqa: E402
+from vllm_omni.lora.request import LoRARequest
 
-PDD_CKPT = Path(
-    "/mnt/workspace/pretrain_models_experimental/"
-    "alibaba-pai-MiniMax-H3-Acc-LoRAs/MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
-)
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+_PDD_LORA_DIR = Path(os.environ.get("MINIMAX_H3_PDD_LORA_DIR", "/nonexistent"))
+PDD_CKPT = _PDD_LORA_DIR / "MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
 
 
 # ---------------------------------------------------------------------------
