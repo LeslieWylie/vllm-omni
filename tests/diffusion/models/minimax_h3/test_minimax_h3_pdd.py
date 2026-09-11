@@ -78,7 +78,6 @@ def test_sigma_block_boundaries_match_9point_schedule():
 
 def test_plan_matches_reference_implementation():
     """Numerical equivalence to the released minimax_h3_pdd.py."""
-    from safetensors import safe_open  # noqa: F401  (import check only)
 
     def _ref_shifted_sigma(shift, sigma):
         return shift * sigma / (1 + (shift - 1) * sigma)
@@ -629,7 +628,7 @@ def test_validate_pdd_sampling_rejects_a_task_the_artifact_was_not_distilled_for
         default_audio_shift=3.0,
     )
     sampling = SimpleNamespace(
-        lora_request=SimpleNamespace(lora_int_id=7),
+        lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
         extra_args={},
         num_inference_steps=9,
     )

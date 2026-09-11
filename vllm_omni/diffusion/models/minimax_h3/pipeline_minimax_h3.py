@@ -148,10 +148,6 @@ from .pdd import (
     PDDAdapter,
     PDDConfig,
     PDDParallelHead,
-    PDD_AUDIO_SHIFT,
-    PDD_NFE,
-    PDD_SIGMA_POINTS,
-    PDD_VIDEO_SHIFT,
     load_minimax_h3_pdd_lora,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy

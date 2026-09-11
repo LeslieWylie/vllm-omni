@@ -56,18 +56,15 @@ Design notes
 
 from __future__ import annotations
 
-import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
+import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
