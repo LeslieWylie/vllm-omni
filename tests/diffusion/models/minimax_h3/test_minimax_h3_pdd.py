@@ -132,6 +132,27 @@ def test_parallel_head_averaging_plan_is_manual_mean():
     assert torch.allclose(head(x)[0], F.linear(x, w_mean, b_mean), atol=1e-5)
 
 
+def test_parallel_head_reset_plan_restores_head0_after_set_plan():
+    """Regression: deactivation used to leave a fused (non-identity) plan in
+    place, so a later non-PDD request on the same DiT would silently keep
+    running through the last PDD step's fused head instead of the base
+    weight."""
+    torch.manual_seed(2)
+    src = nn.Linear(5376, 32, bias=True).float()
+    head = PDDParallelHead(src, 32)
+    # Every copy starts identical to src (head 0's default). Diverge head 1
+    # so selecting it is observably different from src(x).
+    head.weight.data[1] = torch.randn_like(head.weight[1])
+    head.bias.data[1] = torch.randn_like(head.bias[1])
+    plan = torch.zeros(1, 32)
+    plan[0, 1] = 1.0
+    head.set_plan(plan)
+    x = torch.randn(2, 5376)
+    assert not torch.allclose(head(x)[0], src(x), atol=1e-5)
+    head.reset_plan()
+    assert torch.allclose(head(x)[0], src(x), atol=1e-5)
+
+
 def test_parallel_head_rejects_bad_plan_shape():
     src = nn.Linear(16, 4, bias=True).float()
     head = PDDParallelHead(src, 4)
@@ -224,6 +245,35 @@ def test_install_heads_covers_every_dit_not_just_the_first():
     # Re-installing is a no-op rather than wrapping a head inside a head.
     adapter.install_heads(transformer)
     assert torch.allclose(transformer.final_layer.video_out.weight, head_weights["video_out"])
+
+
+def test_disarm_restores_head0_plan_set_by_arm_step():
+    """Regression: deactivation cleared PDDAdapter's own bookkeeping but never
+    touched the installed heads' plan buffer, so a later request reusing this
+    DiT without the adapter (no-LoRA, Turbo, or a different PDD artifact)
+    would keep running through this adapter's last-armed per-step plan."""
+
+    def _make_dit():
+        dit = nn.Module()
+        dit.final_layer = nn.Module()
+        dit.final_layer.video_out = nn.Linear(5376, 96, bias=True).float()
+        dit.final_layer.audio_out = nn.Linear(5376, 32, bias=True).float()
+        return dit
+
+    cfg = PDDConfig()
+    vp, ap = cfg.plans()
+    adapter = PDDAdapter(config=cfg, lora_id=1, video_plans=vp, audio_plans=ap)
+    dit = _make_dit()
+    adapter.install_heads(dit)
+    adapter.arm_step(dit, 1)
+    default_plan = torch.zeros(1, cfg.num_steps)
+    default_plan[0, 0] = 1.0
+    assert not torch.allclose(dit.final_layer.video_out.plan, default_plan)
+    assert not torch.allclose(dit.final_layer.audio_out.plan, default_plan)
+
+    adapter.disarm(dit)
+    assert torch.allclose(dit.final_layer.video_out.plan, default_plan)
+    assert torch.allclose(dit.final_layer.audio_out.plan, default_plan)
 
 
 def test_diffuse_accepts_pdd_adapter_but_build_denoise_inputs_does_not():
@@ -631,9 +681,45 @@ def test_validate_pdd_sampling_rejects_a_task_the_artifact_was_not_distilled_for
         lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
         extra_args={},
         num_inference_steps=9,
+        lora_scale=1.0,
     )
     for bad_task in ("fl2va", "t2va"):
         with pytest.raises(OmniClientError, match="serves \\['ref2va'\\]"):
             MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling, bad_task)
     # The task it *was* distilled for passes the whole schedule check.
     assert MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling, "ref2va") is cfg
+
+
+def test_validate_pdd_sampling_rejects_a_non_unit_lora_scale():
+    """Regression: load_head_bank installs the distilled heads at full
+    strength regardless of the requested lora_scale, so a fractional scale
+    (which does apply to the trunk LoRA delta) silently blended a scaled
+    trunk with an unscaled head bank -- neither the trained PDD model nor
+    the requested scale."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.pdd import _PDD_VARIANTS_BY_NAME
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.errors import OmniClientError
+
+    ref2va = _PDD_VARIANTS_BY_NAME["ref2va"]
+    cfg = PDDConfig(
+        variant=ref2va.name,
+        tasks=ref2va.tasks,
+        dit_component="transformers_ref",
+        filename=ref2va.filename,
+    )
+    fake = SimpleNamespace(
+        _pdd_adapters={7: {"cfg": cfg}},
+        default_video_shift=12.0,
+        default_audio_shift=3.0,
+    )
+    sampling = SimpleNamespace(
+        lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
+        extra_args={},
+        num_inference_steps=9,
+        lora_scale=0.5,
+    )
+    with pytest.raises(OmniClientError, match="lora_scale=1.0"):
+        MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling, "ref2va")
+

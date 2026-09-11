@@ -951,6 +951,18 @@ class MiniMaxH3Pipeline(
     def _validate_pdd_sampling(self, sampling: Any, task: str | None = None) -> PDDConfig:
         extra = sampling.extra_args or {}
         cfg = self._pdd_adapters[sampling.lora_request.lora_int_id]["cfg"]
+        # The head bank is swapped in at full strength (load_head_bank has no
+        # scale knob); only the trunk LoRA delta honors lora_scale. A
+        # fractional scale would silently blend a scaled trunk with an
+        # unscaled distilled head, which isn't the trained PDD model and
+        # isn't the requested scale either. Require full strength.
+        lora_scale = float(sampling.lora_scale)
+        if not math.isclose(lora_scale, 1.0):
+            raise OmniClientError(
+                f"MiniMax-H3 PDD {cfg.variant} 8-step artifact only supports lora_scale=1.0 "
+                f"(the fused head bank is installed at full strength regardless of trunk scale), "
+                f"got {lora_scale:g}"
+            )
         # Each release is distilled against one DiT: Ref2VA against
         # ``transformers_ref``, FL2VA against ``transformer`` (which also serves
         # t2va). Accepting the wrong one would bind the trunk delta and head
@@ -1027,17 +1039,25 @@ class MiniMaxH3Pipeline(
         return adapter
 
     def _deactivate_pdd_heads(self, lora_id: int | None = None) -> None:
-        """Release references to installed PDD adapters. We do NOT swap the
-        heads back to plain ColumnParallelLinear on deactivation because that
-        would require saving originals and breaks fp8/fp32 state. With PDD
-        pinned (only one acceleration LoRA at a time in production) this is
-        fine: an inactive PDD head with no plan set never fuses a non-identity
-        bank, and :meth:`PDDParallelHead.forward` default-plan selects head 0
-        which equals the base weight (init was clone of source)."""
+        """Release references to installed PDD adapters and disarm their heads.
+
+        We do NOT swap the heads back to plain ColumnParallelLinear here
+        because that would require saving originals and breaks fp8/fp32
+        state. Instead each adapter's ``disarm`` resets its heads' plan back
+        to head-0 (== the original base weight), so a later request that
+        reuses the same DiT without this adapter (no-LoRA, Turbo, or a
+        different PDD artifact) does not keep running through this
+        adapter's last-armed per-step plan."""
         if lora_id is None:
+            adapters = list(self._pdd_active_adapters.values())
             self._pdd_active_adapters.clear()
         else:
-            self._pdd_active_adapters.pop(lora_id, None)
+            adapter = self._pdd_active_adapters.pop(lora_id, None)
+            adapters = [adapter] if adapter is not None else []
+        for adapter in adapters:
+            dit = getattr(self, adapter.config.dit_component, None)
+            if dit is not None:
+                adapter.disarm(dit)
 
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
@@ -2958,10 +2978,13 @@ class MiniMaxH3Pipeline(
         any_pdd = any(
             getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states
         )
-        if len(batch_states) > 1 and (
-            mixed_transformers
-            or any_pdd
-            or not self._packed_batch_supported(transformers[0])
+        # any_pdd forces the per-request loop even for a single request: that
+        # loop is the only path that calls arm_step before the forward, and a
+        # PDD head left on its default (un-armed) plan silently runs head 0
+        # for every step instead of the per-step fused bank.
+        if any_pdd or (
+            len(batch_states) > 1
+            and (mixed_transformers or not self._packed_batch_supported(transformers[0]))
         ):
             if any_pdd and not mixed_transformers:
                 logger.warning_once(

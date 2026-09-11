@@ -469,6 +469,11 @@ class PDDParallelHead(nn.Module):
             )
         self.plan.copy_(plan.to(device=self.weight.device, dtype=torch.float32))
 
+    def reset_plan(self) -> None:
+        """Return to the default head-0 plan (== the original base weight)."""
+        self.plan.zero_()
+        self.plan[0, 0] = 1.0
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         """Returns ``(output, None)`` to mimic ``ColumnParallelLinear(return_bias=True)``."""
         plan = self.plan
@@ -715,6 +720,24 @@ class PDDAdapter:
         device = v_head.weight.device
         v_head.set_plan(self.video_plans[step_index : step_index + 1].to(device=device))
         a_head.set_plan(self.audio_plans[step_index : step_index + 1].to(device=device))
+
+    def disarm(self, transformer: nn.Module) -> None:
+        """Reset a transformer's PDD heads to the default (identity) plan.
+
+        Call on deactivation: heads stay installed as ``PDDParallelHead``
+        (never swapped back to plain ``ColumnParallelLinear``), so a later
+        request that reuses this transformer without this adapter would
+        otherwise keep running through this adapter's last-armed step plan.
+        """
+        fl = getattr(transformer, "final_layer", None)
+        if fl is None:
+            return
+        v_head = getattr(fl, "video_out", None)
+        a_head = getattr(fl, "audio_out", None)
+        if isinstance(v_head, PDDParallelHead):
+            v_head.reset_plan()
+        if isinstance(a_head, PDDParallelHead):
+            a_head.reset_plan()
 
     def install_heads(self, transformer: nn.Module) -> None:
         """Replace final_layer.video_out / audio_out with PDDParallelHead modules.
