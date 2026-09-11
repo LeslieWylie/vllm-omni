@@ -144,6 +144,16 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
+from .pdd import (
+    PDDAdapter,
+    PDDConfig,
+    PDDParallelHead,
+    PDD_AUDIO_SHIFT,
+    PDD_NFE,
+    PDD_SIGMA_POINTS,
+    PDD_VIDEO_SHIFT,
+    load_minimax_h3_pdd_lora,
+)
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -299,6 +309,7 @@ _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
 _STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
 _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
+_STEP_PDD_ADAPTER = "minimax_h3_pdd_adapter"
 
 
 def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
@@ -635,6 +646,36 @@ def _broadcast_tensor(
     return output
 
 
+def _reference_image_shape_matched(
+    image: Image.Image, target_width: int, target_height: int
+) -> tuple[int, int]:
+    """Reference latent shape locked to the *target* aspect ratio.
+
+    ``_reference_image_shape`` sizes each reference at its own native aspect,
+    short edge -> ``MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE``. Reference and
+    target latents then share one center-aligned RoPE spatial grid, so a
+    reference wider than the target overhangs it at the extreme left/right
+    columns: the target's border tokens land on the reference's edge content
+    (e.g. an environment reference's wall sconces) and it ghosts onto the frame
+    borders. Locking the reference to the target aspect makes the two grids
+    coincide at the borders and removes the ghost. The short edge still drives
+    resolution, so identity detail is preserved; only the aspect is adjusted.
+    """
+    _reference_image_shape(image)  # keep native aspect / dimension validation
+    target_ratio = float(target_width) / float(target_height)
+    short_edge = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+    if target_ratio >= 1.0:
+        ref_width = short_edge * target_ratio
+        ref_height = float(short_edge)
+    else:
+        ref_width = float(short_edge)
+        ref_height = short_edge / target_ratio
+    return (
+        _align_multiple(ref_width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(ref_height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+    )
+
+
 class _SingleRankEncoderGroup:
     """Lightweight encoder group for ``text_encoder_tp_size == 1``.
 
@@ -696,6 +737,20 @@ class MiniMaxH3Pipeline(
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
 
+    def _ensure_pdd_bookkeeping(self) -> None:
+        """Create the PDD adapter registries if ``__init__`` has not run.
+
+        ``__init__`` always populates these, but the LoRA entry points are also
+        exercised on partially constructed pipelines, where an AttributeError
+        raised from PDD bookkeeping would mask the turbo / generic PEFT path
+        under test (same reason ``_base_schedule_by_partition`` has a default).
+        Writing through ``__dict__`` keeps nn.Module's ``__setattr__`` out of it.
+        """
+        state = self.__dict__
+        state.setdefault("_pdd_adapters", {})
+        state.setdefault("_pdd_adapter_ids", set())
+        state.setdefault("_pdd_active_adapters", {})
+
     def _load_diffusion_lora_adapter(
         self,
         *,
@@ -703,11 +758,19 @@ class MiniMaxH3Pipeline(
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
+        self._ensure_pdd_bookkeeping()
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
+        self._pdd_adapter_ids.discard(lora_request.lora_int_id)
+        # Drop any cached PDD head install handle from a prior load with the
+        # same id (eviction + re-add). The installed-adapter handle must go too:
+        # with two PDD releases in play, a reused id could otherwise keep a
+        # handle pointing at the other variant's bank and DiT.
+        self._pdd_adapters.pop(lora_request.lora_int_id, None)
+        self._pdd_active_adapters.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if od_config is not None:
@@ -717,12 +780,32 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("model-level CPU offload")
                 elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
                     offload_modes.append("layerwise offload")
+        offload_mode = " or ".join(offload_modes) or None
+        # Try PDD first: the PDD loader raises if the path names the PDD
+        # artifact but its contents are malformed, and returns None for a
+        # non-PDD path so turbo / generic PEFT get their chance.
+        pdd_loaded = load_minimax_h3_pdd_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=offload_mode,
+        )
+        if pdd_loaded is not None:
+            lora_model, peft_helper, pdd_cfg, head_weights, head_biases = pdd_loaded
+            self._pdd_adapters[lora_request.lora_int_id] = {
+                "cfg": pdd_cfg,
+                "head_weights": head_weights,
+                "head_biases": head_biases,
+            }
+            self._pdd_adapter_ids.add(lora_request.lora_int_id)
+            return lora_model, peft_helper
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
-            unsupported_offload_mode=" or ".join(offload_modes) or None,
+            unsupported_offload_mode=offload_mode,
         )
         if loaded is not None:
             lora_model, peft_helper, turbo_spec = loaded
@@ -758,6 +841,25 @@ class MiniMaxH3Pipeline(
             if missing:
                 raise ValueError(
                     "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                    f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+                )
+            return
+        # PDD adapters are allowed to have unbound trunk LoRA entries while
+        # their head banks are installed separately via _ensure_pdd_heads().
+        # The trunk binding is still verified to be complete *among the set of
+        # targeted modules*; any missing trunk target is an error.
+        self._ensure_pdd_bookkeeping()
+        if lora_model.id in self._pdd_adapter_ids:
+            missing = sorted(
+                name for name in lora_model.loras
+                if name not in bound_lora_names
+                # Final-layer adaln is not targeted by PDD (artifact contains
+                # only block-level adaln); don't require it.
+                and ".final_layer." not in name
+            )
+            if missing:
+                raise ValueError(
+                    "MiniMax-H3 PDD LoRA trunk binding is incomplete: "
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
             return
@@ -841,6 +943,106 @@ class MiniMaxH3Pipeline(
             return None
         return self._turbo_lora_specs.get(lora_request.lora_int_id)
 
+    def _has_active_pdd_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        self._ensure_pdd_bookkeeping()
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._pdd_adapter_ids
+        )
+
+    def _validate_pdd_sampling(self, sampling: Any, task: str | None = None) -> PDDConfig:
+        extra = sampling.extra_args or {}
+        cfg = self._pdd_adapters[sampling.lora_request.lora_int_id]["cfg"]
+        # Each release is distilled against one DiT: Ref2VA against
+        # ``transformers_ref``, FL2VA against ``transformer`` (which also serves
+        # t2va). Accepting the wrong one would bind the trunk delta and head
+        # bank to a DiT that never saw them, on a schedule pinned to 9 steps --
+        # a silently bad video rather than an error. Refuse instead.
+        if task is not None and task not in cfg.tasks:
+            raise OmniClientError(
+                f"MiniMax-H3 PDD {cfg.variant} 8-step artifact ({cfg.filename}) serves "
+                f"{sorted(cfg.tasks)}, got task={task!r}; use the {task} artifact or drop the "
+                "lora field to fall back to the undistilled schedule"
+            )
+        sigma_points = sampling.num_inference_steps
+        if sigma_points != cfg.sigma_points:
+            raise OmniClientError(
+                f"MiniMax-H3 PDD {cfg.variant} {cfg.nfe}-step requires "
+                f"num_inference_steps={cfg.sigma_points} "
+                f"({cfg.nfe} NFE + terminal zero), got {sigma_points}"
+            )
+        try:
+            video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(f"MiniMax-H3 PDD requires flow_shift={cfg.video_shift:g}") from exc
+        if not math.isclose(video_shift, cfg.video_shift):
+            raise OmniClientError(f"MiniMax-H3 PDD requires flow_shift={cfg.video_shift:g}, got {video_shift:g}")
+        try:
+            audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(
+                f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}"
+            ) from exc
+        if not math.isclose(audio_shift, cfg.audio_shift):
+            raise OmniClientError(
+                f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}, got {audio_shift:g}"
+            )
+        return cfg
+
+    def _ensure_pdd_heads(self, lora_id: int) -> PDDAdapter:
+        """Install PDD parallel heads on the artifact's own DiT.
+
+        The LoRA manager has already wrapped the trunk linear layers by this
+        point; we now swap final_layer.video_out / audio_out for PDDParallelHead
+        modules (fp32, TP-sharded) and copy the artifact's 32-copy bank into
+        them. Idempotent across activations.
+
+        Only ``cfg.dit_component`` is touched. In a combined deployment the
+        other DiT serves the other task family and has its own release, so
+        installing a Ref2VA bank on the FL2VA DiT (as an earlier version did)
+        would corrupt every fl2va/t2va request.
+        """
+        adapter = self._pdd_active_adapters.get(lora_id)
+        if adapter is not None:
+            return adapter
+        info = self._pdd_adapters[lora_id]
+        cfg: PDDConfig = info["cfg"]
+        v_plans, a_plans = cfg.plans()
+        adapter = PDDAdapter(
+            config=cfg,
+            lora_id=lora_id,
+            video_plans=v_plans,
+            audio_plans=a_plans,
+        )
+        dit = getattr(self, cfg.dit_component, None)
+        if dit is None:
+            raise OmniClientError(
+                f"MiniMax-H3 PDD {cfg.variant} artifact targets {cfg.dit_component!r}, "
+                f"absent from a {self.partition!r} deployment"
+            )
+        # Only install if this DiT hasn't had heads replaced by this adapter
+        # already (possible on re-activation after deactivation).
+        if not isinstance(dit.final_layer.video_out, PDDParallelHead):
+            adapter.install_heads(dit)
+        adapter.load_head_bank(dit, info["head_weights"], info["head_biases"])
+        self._pdd_active_adapters[lora_id] = adapter
+        return adapter
+
+    def _deactivate_pdd_heads(self, lora_id: int | None = None) -> None:
+        """Release references to installed PDD adapters. We do NOT swap the
+        heads back to plain ColumnParallelLinear on deactivation because that
+        would require saving originals and breaks fp8/fp32 state. With PDD
+        pinned (only one acceleration LoRA at a time in production) this is
+        fine: an inactive PDD head with no plan set never fuses a non-identity
+        bank, and :meth:`PDDParallelHead.forward` default-plan selects head 0
+        which equals the base weight (init was clone of source)."""
+        if lora_id is None:
+            self._pdd_active_adapters.clear()
+        else:
+            self._pdd_active_adapters.pop(lora_id, None)
+
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
 
@@ -904,6 +1106,12 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
+        # PDD acceleration LoRA: maps adapter_id -> {cfg, head_weights, head_biases}
+        # populated by _load_diffusion_lora_adapter when a PDD artifact is detected.
+        self._pdd_adapters: dict[int, dict[str, Any]] = {}
+        # PDD adapters whose parallel heads are currently installed on the DiT.
+        self._pdd_adapter_ids: set[int] = set()
+        self._pdd_active_adapters: dict[int, PDDAdapter] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -2094,6 +2302,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pdd_adapter: PDDAdapter | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -2120,6 +2329,22 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        if pdd_adapter is not None:
+            # PDD: disable packed multi-request batching because different
+            # requests at different step indices need different fused heads
+            # (the plan is per-DiT-module, not per-row). Arming the head plan
+            # happens from a step_profiler context that fires just before each
+            # model forward.
+            pdd_step_state = {"index": 0}
+
+            def _pdd_arm(step_idx: int):
+                pdd_adapter.arm_step(transformer, step_idx)
+                pdd_step_state["index"] = step_idx
+                return nullcontext()
+
+            step_profiler = _pdd_arm
+        else:
+            step_profiler = None
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
@@ -2135,6 +2360,7 @@ class MiniMaxH3Pipeline(
                     imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     on_step=lambda step, video, audio: progress.update(),
+                    step_profiler=step_profiler,
                 )
 
         return self._unpack_denoised_rows(
@@ -2232,6 +2458,11 @@ class MiniMaxH3Pipeline(
         extra = sampling.extra_args or {}
         turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
+        has_pdd_lora = self._has_active_pdd_lora(sampling)
+        if turbo_spec is not None and has_pdd_lora:
+            raise OmniClientError(
+                "MiniMax-H3 Turbo and PDD acceleration adapters cannot be active simultaneously"
+            )
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
@@ -2248,6 +2479,10 @@ class MiniMaxH3Pipeline(
                 video_shift=self.default_video_shift,
                 audio_shift=self.default_audio_shift,
             )
+        pdd_cfg: PDDConfig | None = None
+        if has_pdd_lora:
+            pdd_cfg = self._validate_pdd_sampling(sampling, task)
+            _ = self._ensure_pdd_heads(sampling.lora_request.lora_int_id)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -2293,7 +2528,7 @@ class MiniMaxH3Pipeline(
         elif task == "ref2va":
             prepared_images = []
             for item in images:
-                ref_width, ref_height = _reference_image_shape(item)
+                ref_width, ref_height = _reference_image_shape_matched(item, width, height)
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None
         else:
@@ -2465,9 +2700,20 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        video_shift = float(extra.get("flow_shift", self.default_video_shift))
-        audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        # When PDD is active the sigma grid is the 9-point schedule that lines up
+        # with the PDD block boundaries -- exactly num_inference_steps=9. No
+        # checkpoint-pinned schedule applies, so skip that lookup/mismatch-check
+        # entirely rather than let it race the override below.
+        if has_pdd_lora and pdd_cfg is not None:
+            base_schedule = None
+            num_steps = pdd_cfg.sigma_points
+            video_shift = pdd_cfg.video_shift
+            audio_shift = pdd_cfg.audio_shift
+        else:
+            base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
+            video_shift = float(extra.get("flow_shift", self.default_video_shift))
+            audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+
         quality_plan = self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
@@ -2500,6 +2746,8 @@ class MiniMaxH3Pipeline(
             "audio_shift": audio_shift,
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
+            "pdd_adapter": self._pdd_active_adapters.get(sampling.lora_request.lora_int_id)
+            if has_pdd_lora and sampling.lora_request is not None else None,
         }
 
     @staticmethod
@@ -2521,6 +2769,10 @@ class MiniMaxH3Pipeline(
             prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
         )
         denoise_kwargs = self._denoise_kwargs(context)
+        # ``pdd_adapter`` is not a _build_denoise_inputs argument -- it only
+        # steers the per-step head arming inside diffuse() -- so it rides
+        # alongside the selected denoise kwargs rather than in them.
+        denoise_kwargs["pdd_adapter"] = context.get("pdd_adapter")
         num_outputs = context["num_outputs"]
         videos = []
         audios = []
@@ -2661,6 +2913,7 @@ class MiniMaxH3Pipeline(
                     "latent_w": context["latent_w"],
                     "audio_t": context["audio_t"],
                 },
+                _STEP_PDD_ADAPTER: context.get("pdd_adapter"),
             }
         )
         return state
@@ -2699,8 +2952,29 @@ class MiniMaxH3Pipeline(
         }
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
 
-        if len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])):
-            if mixed_transformers:
+        # PDD safety: if any request in the batch is running PDD, fall back to
+        # one-forward-per-request so each request's plan can be armed
+        # independently.  The plan is a per-DiT-module state, so co-batching
+        # requests at different step indices (or PDD + non-PDD) would use the
+        # wrong fused head.  Request-mode (non-step) never reaches here -- it
+        # uses minimax_h3_denoise_loop directly with a step_profiler that arms
+        # the plan each iteration.
+        any_pdd = any(
+            getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states
+        )
+        if len(batch_states) > 1 and (
+            mixed_transformers
+            or any_pdd
+            or not self._packed_batch_supported(transformers[0])
+        ):
+            if any_pdd and not mixed_transformers:
+                logger.warning_once(
+                    "MiniMax H3 step batching is disabled while PDD acceleration is active: "
+                    "PDD fused heads are per-step per-request state and cannot be co-batched. "
+                    "Running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            elif mixed_transformers:
                 logger.warning_once(
                     "MiniMax H3 step batch contains requests for different task-specific DiTs; "
                     "running %d requests one forward at a time.",
@@ -2727,6 +3001,10 @@ class MiniMaxH3Pipeline(
             video_parts: list[torch.Tensor] = []
             audio_parts: list[torch.Tensor] = []
             for index, branch in enumerate(branches):
+                # Arm the PDD plan for this request's current step *before* its forward.
+                pdd_adapter = batch_states[index].extra.get(_STEP_PDD_ADAPTER)
+                if pdd_adapter is not None:
+                    pdd_adapter.arm_step(transformers[index], batch_states[index].step_index)
                 forward_kwargs = branch.forward_kwargs(
                     video_rows=video_rows[index],
                     audio_rows=audio_rows[index],
