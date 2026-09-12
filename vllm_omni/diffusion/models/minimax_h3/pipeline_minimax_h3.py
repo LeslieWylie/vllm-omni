@@ -64,6 +64,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -374,6 +375,19 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        video = [video]
+    if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+        encoded_videos = [bytes(item) for item in video]
+    else:
+        encoded_videos = None
+    if encoded_videos is not None:
+        return {
+            "video": encoded_videos,
+            "audio": [None] * len(encoded_videos),
+            "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
+            "fps": MINIMAX_H3_FPS,
+        }
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
         # banded video rather than as an error.
@@ -640,36 +654,6 @@ def _broadcast_tensor(
         output = torch.empty(tensor_shape, device=device, dtype=dtype)
     dist.broadcast(output, src=0, group=group)
     return output
-
-
-def _reference_image_shape_matched(
-    image: Image.Image, target_width: int, target_height: int
-) -> tuple[int, int]:
-    """Reference latent shape locked to the *target* aspect ratio.
-
-    ``_reference_image_shape`` sizes each reference at its own native aspect,
-    short edge -> ``MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE``. Reference and
-    target latents then share one center-aligned RoPE spatial grid, so a
-    reference wider than the target overhangs it at the extreme left/right
-    columns: the target's border tokens land on the reference's edge content
-    (e.g. an environment reference's wall sconces) and it ghosts onto the frame
-    borders. Locking the reference to the target aspect makes the two grids
-    coincide at the borders and removes the ghost. The short edge still drives
-    resolution, so identity detail is preserved; only the aspect is adjusted.
-    """
-    _reference_image_shape(image)  # keep native aspect / dimension validation
-    target_ratio = float(target_width) / float(target_height)
-    short_edge = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
-    if target_ratio >= 1.0:
-        ref_width = short_edge * target_ratio
-        ref_height = float(short_edge)
-    else:
-        ref_width = float(short_edge)
-        ref_height = short_edge / target_ratio
-    return (
-        _align_multiple(ref_width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
-        _align_multiple(ref_height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
-    )
 
 
 class _SingleRankEncoderGroup:
@@ -2351,11 +2335,8 @@ class MiniMaxH3Pipeline(
             # (the plan is per-DiT-module, not per-row). Arming the head plan
             # happens from a step_profiler context that fires just before each
             # model forward.
-            pdd_step_state = {"index": 0}
-
             def _pdd_arm(step_idx: int):
                 pdd_adapter.arm_step(transformer, step_idx)
-                pdd_step_state["index"] = step_idx
                 return nullcontext()
 
             step_profiler = _pdd_arm
@@ -2388,6 +2369,80 @@ class MiniMaxH3Pipeline(
             latent_w=latent_w,
             audio_t=audio_t,
         )
+
+    def decode_to_mp4(
+        self,
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        max_pending: int = 2,
+        batch_frames: int = 17,
+        video_codec_options: dict[str, str] | None = None,
+    ) -> bytes:
+        """Decode and encode one output on the worker without full-video materialization.
+
+        Audio is decoded first so the incremental mux session can attach its audio
+        stream before temporal video chunks arrive. The callback receives committed
+        float32 ``BCTHW`` frames, performs the requested-size crop and uint8
+        conversion in the worker, then applies bounded backpressure to the encoder.
+        """
+        from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+
+        if batch_frames <= 0:
+            raise ValueError("batch_frames must be positive")
+
+        with self._component_on_device(self.audio_vae):
+            audio = self.audio_vae.decode_latent(audio_latent)
+        audio_np = audio.detach().float().cpu().numpy()
+        if audio_np.ndim == 3 and audio_np.shape[0] == 1:
+            audio_np = audio_np[0]
+        encoder = ChunkedMP4Encoder(
+            width=width,
+            height=height,
+            fps=MINIMAX_H3_FPS,
+            audio_waveform=audio_np,
+            audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+            max_pending=max_pending,
+            video_codec_options=video_codec_options,
+        )
+
+        pending_chunks: list[torch.Tensor] = []
+        pending_frames = 0
+
+        def flush_pending() -> None:
+            nonlocal pending_frames
+            if not pending_chunks:
+                return
+            batched = torch.cat(pending_chunks, dim=1)
+            encoder.push(batched[0].cpu().numpy())
+            pending_chunks.clear()
+            pending_frames = 0
+
+        def on_chunk(frames: torch.Tensor) -> None:
+            nonlocal pending_frames
+            prepared = _prepare_minimax_h3_video_output(frames[..., :height, :width])
+            if prepared.shape[0] != 1:
+                raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
+            pending_chunks.append(prepared)
+            pending_frames += int(prepared.shape[1])
+            if pending_frames >= batch_frames:
+                flush_pending()
+
+        try:
+            with self._component_on_device(self.video_vae):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=True,
+                ):
+                    self.video_vae.decode_with_chunks(video_latent, on_chunk=on_chunk)
+            flush_pending()
+            return encoder.finish()
+        except BaseException:
+            encoder.abort()
+            raise
 
     def decode(
         self,
@@ -2472,6 +2527,11 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
+        preencode_batch_frames = (
+            normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
+            if extra.get("preencode_mp4", False)
+            else 17
+        )
         turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
         has_pdd_lora = self._has_active_pdd_lora(sampling)
@@ -2544,7 +2604,7 @@ class MiniMaxH3Pipeline(
         elif task == "ref2va":
             prepared_images = []
             for item in images:
-                ref_width, ref_height = _reference_image_shape_matched(item, width, height)
+                ref_width, ref_height = _reference_image_shape(item)
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None
         else:
@@ -2764,6 +2824,11 @@ class MiniMaxH3Pipeline(
             "num_outputs": num_outputs,
             "pdd_adapter": self._pdd_active_adapters.get(sampling.lora_request.lora_int_id)
             if has_pdd_lora and sampling.lora_request is not None else None,
+            "preencode_mp4": bool(extra.get("preencode_mp4", False)),
+            "preencode_batch_frames": preencode_batch_frames,
+            "video_codec_options": normalize_video_codec_options(
+                extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"})
+            ),
         }
 
     @staticmethod
@@ -2794,16 +2859,33 @@ class MiniMaxH3Pipeline(
         audios = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             video_latent, audio_latent = self.diffuse(**{**denoise_kwargs, "seed": output_seed})
-            video, audio = self.decode(
-                video_latent,
-                audio_latent,
-                height=context["height"],
-                width=context["width"],
-            )
-            videos.append(_prepare_minimax_h3_video_output(video))
-            audios.append(audio)
-        video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
-        audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
+            if context["preencode_mp4"]:
+                videos.append(
+                    self.decode_to_mp4(
+                        video_latent,
+                        audio_latent,
+                        height=context["height"],
+                        width=context["width"],
+                        video_codec_options=context["video_codec_options"],
+                        batch_frames=context["preencode_batch_frames"],
+                    )
+                )
+                audios.append(None)
+            else:
+                video, audio = self.decode(
+                    video_latent,
+                    audio_latent,
+                    height=context["height"],
+                    width=context["width"],
+                )
+                videos.append(_prepare_minimax_h3_video_output(video))
+                audios.append(audio)
+        if videos and isinstance(videos[0], bytes):
+            video = videos[0] if len(videos) == 1 else videos
+            audio = None
+        else:
+            video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
+            audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
@@ -2928,6 +3010,9 @@ class MiniMaxH3Pipeline(
                     "latent_h": context["latent_h"],
                     "latent_w": context["latent_w"],
                     "audio_t": context["audio_t"],
+                    "preencode_mp4": context.get("preencode_mp4", False),
+                    "preencode_batch_frames": context.get("preencode_batch_frames", 17),
+                    "video_codec_options": context.get("video_codec_options"),
                 },
                 _STEP_PDD_ADAPTER: context.get("pdd_adapter"),
             }
@@ -3128,13 +3213,24 @@ class MiniMaxH3Pipeline(
             latent_w=shape["latent_w"],
             audio_t=shape["audio_t"],
         )
-        video, audio = self.decode(
-            video_latent,
-            audio_latent,
-            height=shape["height"],
-            width=shape["width"],
-        )
-        video = _prepare_minimax_h3_video_output(video)
+        if shape.get("preencode_mp4", False):
+            video = self.decode_to_mp4(
+                video_latent,
+                audio_latent,
+                height=shape["height"],
+                width=shape["width"],
+                video_codec_options=shape.get("video_codec_options"),
+                batch_frames=shape.get("preencode_batch_frames", 17),
+            )
+            audio = None
+        else:
+            video, audio = self.decode(
+                video_latent,
+                audio_latent,
+                height=shape["height"],
+                width=shape["width"],
+            )
+            video = _prepare_minimax_h3_video_output(video)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
