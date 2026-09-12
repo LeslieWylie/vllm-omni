@@ -14,10 +14,10 @@ The handful of tests that load a real PDD artifact skip automatically unless
 
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 
-import inspect
 import pytest
 import torch
 import torch.nn as nn
@@ -82,8 +82,8 @@ def test_plan_matches_reference_implementation():
     def _ref_shifted_sigma(shift, sigma):
         return shift * sigma / (1 + (shift - 1) * sigma)
 
-    def _ref_grid(shift, N):
-        sigma = torch.linspace(1.0, 0.0, N + 1, dtype=torch.float64)
+    def _ref_grid(shift, num_steps):
+        sigma = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
         return 1.0 - _ref_shifted_sigma(shift, sigma)
 
     def _ref_plan(step_sizes, start, block):
@@ -132,7 +132,7 @@ def test_parallel_head_averaging_plan_is_manual_mean():
     assert torch.allclose(head(x)[0], F.linear(x, w_mean, b_mean), atol=1e-5)
 
 
-def test_parallel_head_reset_plan_restores_head0_after_set_plan():
+def test_parallel_head_reset_plan_restores_base_after_artifact_load():
     """Regression: deactivation used to leave a fused (non-identity) plan in
     place, so a later non-PDD request on the same DiT would silently keep
     running through the last PDD step's fused head instead of the base
@@ -140,10 +140,9 @@ def test_parallel_head_reset_plan_restores_head0_after_set_plan():
     torch.manual_seed(2)
     src = nn.Linear(5376, 32, bias=True).float()
     head = PDDParallelHead(src, 32)
-    # Every copy starts identical to src (head 0's default). Diverge head 1
-    # so selecting it is observably different from src(x).
-    head.weight.data[1] = torch.randn_like(head.weight[1])
-    head.bias.data[1] = torch.randn_like(head.bias[1])
+    # Loading an artifact replaces ALL bank entries, including head 0.
+    head.weight.data.copy_(torch.randn_like(head.weight))
+    head.bias.data.copy_(torch.randn_like(head.bias))
     plan = torch.zeros(1, 32)
     plan[0, 1] = 1.0
     head.set_plan(plan)
@@ -282,8 +281,8 @@ def test_diffuse_accepts_pdd_adapter_but_build_denoise_inputs_does_not():
     the argument (it steers per-step head arming); the input builder must not
     see it."""
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        MiniMaxH3Pipeline,
         _MINIMAX_H3_DENOISE_INPUT_KEYS,
+        MiniMaxH3Pipeline,
     )
 
     diffuse_params = inspect.signature(MiniMaxH3Pipeline.diffuse).parameters
@@ -360,9 +359,7 @@ def test_lora_model_from_tensors_accepts_pdd_trunk():
     with safe_open(PDD_CKPT, framework="pt", device="cpu") as f:
         cfg = _parse_pdd_metadata(f.metadata() or {})
         trunk, _hw, _hb = _validate_and_convert_tensors(f, cfg)
-    ph = PEFTHelper.from_dict(
-        {"r": _PDD_RANK, "lora_alpha": _PDD_ALPHA, "target_modules": _PDD_TRUNK_TARGET_PATTERN}
-    )
+    ph = PEFTHelper.from_dict({"r": _PDD_RANK, "lora_alpha": _PDD_ALPHA, "target_modules": _PDD_TRUNK_TARGET_PATTERN})
     lm = LoRAModel.from_lora_tensors(
         lora_model_id=9001,
         tensors=trunk,
@@ -410,12 +407,15 @@ def test_load_minimax_h3_pdd_lora_accepts_combined_partition():
 @pytest.mark.skipif(not PDD_CKPT.is_file(), reason="PDD checkpoint not present")
 def test_load_minimax_h3_pdd_lora_returns_none_for_non_pdd_path(tmp_path):
     # A path that doesn't contain the PDD filename returns None (PEFT fallback).
-    assert load_minimax_h3_pdd_lora(
-        partition="ref2va",
-        lora_request=LoRARequest(lora_int_id=9003, lora_name="x", lora_path=str(tmp_path)),
-        lora_path=str(tmp_path),
-        dtype=torch.bfloat16,
-    ) is None
+    assert (
+        load_minimax_h3_pdd_lora(
+            partition="ref2va",
+            lora_request=LoRARequest(lora_int_id=9003, lora_name="x", lora_path=str(tmp_path)),
+            lora_path=str(tmp_path),
+            dtype=torch.bfloat16,
+        )
+        is None
+    )
 
 
 @pytest.mark.skipif(not PDD_CKPT.is_file(), reason="PDD checkpoint not present")
@@ -469,9 +469,7 @@ def test_variant_registry_maps_each_release_to_its_own_dit():
     assert not (ref2va.tasks & fl2va.tasks)
 
 
-@pytest.mark.skipif(
-    not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present"
-)
+@pytest.mark.skipif(not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present")
 @pytest.mark.parametrize(
     "ckpt,partition,expected_component",
     [
@@ -481,9 +479,7 @@ def test_variant_registry_maps_each_release_to_its_own_dit():
         (FL2VA_CKPT, "fl2va", "transformer"),
     ],
 )
-def test_trunk_lora_keys_are_anchored_on_the_variants_own_dit(
-    ckpt, partition, expected_component
-):
+def test_trunk_lora_keys_are_anchored_on_the_variants_own_dit(ckpt, partition, expected_component):
     """Every trunk key must match the variant's own component-anchored pattern,
     and none may match the other DiT's."""
     import re
@@ -491,25 +487,19 @@ def test_trunk_lora_keys_are_anchored_on_the_variants_own_dit(
     from vllm_omni.diffusion.models.minimax_h3.pdd import _trunk_target_pattern
 
     req = LoRARequest(lora_int_id=9101, lora_name="pdd", lora_path=str(ckpt))
-    loaded = load_minimax_h3_pdd_lora(
-        partition=partition, lora_request=req, lora_path=str(ckpt), dtype=torch.bfloat16
-    )
+    loaded = load_minimax_h3_pdd_lora(partition=partition, lora_request=req, lora_path=str(ckpt), dtype=torch.bfloat16)
     assert loaded is not None
     _lm, _ph, cfg, _hw, _hb = loaded
     assert cfg.dit_component == expected_component
     assert len(_lm.loras) == 362
     own = cfg.trunk_target_pattern
-    other = _trunk_target_pattern(
-        "transformer" if expected_component == "transformers_ref" else "transformers_ref"
-    )
+    other = _trunk_target_pattern("transformer" if expected_component == "transformers_ref" else "transformers_ref")
     assert all(re.search(own, name) for name in _lm.loras)
     assert not any(re.search(other, name) for name in _lm.loras)
     assert all(name.startswith(f"{expected_component}.") for name in _lm.loras)
 
 
-@pytest.mark.skipif(
-    not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present"
-)
+@pytest.mark.skipif(not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present")
 def test_the_two_releases_are_not_interchangeable():
     """Same shapes, different weights -- so only the name/metadata can route
     them, and the loader must not treat one as the other."""
@@ -544,23 +534,17 @@ def test_fl2va_artifact_takes_the_pdd_path_not_the_peft_fallback():
 def test_ref2va_artifact_is_refused_on_an_fl2va_only_deployment():
     req = LoRARequest(lora_int_id=9103, lora_name="pdd", lora_path=str(PDD_CKPT))
     with pytest.raises(ValueError, match="partition holding the ref2va DiT"):
-        load_minimax_h3_pdd_lora(
-            partition="fl2va", lora_request=req, lora_path=str(PDD_CKPT), dtype=torch.bfloat16
-        )
+        load_minimax_h3_pdd_lora(partition="fl2va", lora_request=req, lora_path=str(PDD_CKPT), dtype=torch.bfloat16)
 
 
 @pytest.mark.skipif(not FL2VA_CKPT.is_file(), reason="FL2VA checkpoint not present")
 def test_fl2va_artifact_is_refused_on_a_ref2va_only_deployment():
     req = LoRARequest(lora_int_id=9104, lora_name="pdd", lora_path=str(FL2VA_CKPT))
     with pytest.raises(ValueError, match="partition holding the fl2va DiT"):
-        load_minimax_h3_pdd_lora(
-            partition="ref2va", lora_request=req, lora_path=str(FL2VA_CKPT), dtype=torch.bfloat16
-        )
+        load_minimax_h3_pdd_lora(partition="ref2va", lora_request=req, lora_path=str(FL2VA_CKPT), dtype=torch.bfloat16)
 
 
-@pytest.mark.skipif(
-    not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present"
-)
+@pytest.mark.skipif(not (PDD_CKPT.is_file() and FL2VA_CKPT.is_file()), reason="PDD checkpoints not present")
 def test_release_directory_holding_both_variants_is_refused():
     """Silently picking one by iteration order would accelerate half the
     traffic with the wrong distillation."""
@@ -722,4 +706,3 @@ def test_validate_pdd_sampling_rejects_a_non_unit_lora_scale():
     )
     with pytest.raises(OmniClientError, match="lora_scale=1.0"):
         MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling, "ref2va")
-

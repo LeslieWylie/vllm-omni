@@ -831,7 +831,8 @@ class MiniMaxH3Pipeline(
         self._ensure_pdd_bookkeeping()
         if lora_model.id in self._pdd_adapter_ids:
             missing = sorted(
-                name for name in lora_model.loras
+                name
+                for name in lora_model.loras
                 if name not in bound_lora_names
                 # Final-layer adaln is not targeted by PDD (artifact contains
                 # only block-level adaln); don't require it.
@@ -974,13 +975,9 @@ class MiniMaxH3Pipeline(
         try:
             audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         except (TypeError, ValueError) as exc:
-            raise OmniClientError(
-                f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}"
-            ) from exc
+            raise OmniClientError(f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}") from exc
         if not math.isclose(audio_shift, cfg.audio_shift):
-            raise OmniClientError(
-                f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}, got {audio_shift:g}"
-            )
+            raise OmniClientError(f"MiniMax-H3 PDD requires audio_flow_shift={cfg.audio_shift:g}, got {audio_shift:g}")
         return cfg
 
     def _ensure_pdd_heads(self, lora_id: int) -> PDDAdapter:
@@ -1028,7 +1025,7 @@ class MiniMaxH3Pipeline(
         We do NOT swap the heads back to plain ColumnParallelLinear here
         because that would require saving originals and breaks fp8/fp32
         state. Instead each adapter's ``disarm`` resets its heads' plan back
-        to head-0 (== the original base weight), so a later request that
+        to the saved original base weights, so a later request that
         reuses the same DiT without this adapter (no-LoRA, Turbo, or a
         different PDD artifact) does not keep running through this
         adapter's last-armed per-step plan."""
@@ -2536,9 +2533,7 @@ class MiniMaxH3Pipeline(
         has_native_lora = self._has_active_native_lora(sampling)
         has_pdd_lora = self._has_active_pdd_lora(sampling)
         if turbo_spec is not None and has_pdd_lora:
-            raise OmniClientError(
-                "MiniMax-H3 Turbo and PDD acceleration adapters cannot be active simultaneously"
-            )
+            raise OmniClientError("MiniMax-H3 Turbo and PDD acceleration adapters cannot be active simultaneously")
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
@@ -2823,7 +2818,8 @@ class MiniMaxH3Pipeline(
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
             "pdd_adapter": self._pdd_active_adapters.get(sampling.lora_request.lora_int_id)
-            if has_pdd_lora and sampling.lora_request is not None else None,
+            if has_pdd_lora and sampling.lora_request is not None
+            else None,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": preencode_batch_frames,
             "video_codec_options": normalize_video_codec_options(
@@ -3060,16 +3056,13 @@ class MiniMaxH3Pipeline(
         # wrong fused head.  Request-mode (non-step) never reaches here -- it
         # uses minimax_h3_denoise_loop directly with a step_profiler that arms
         # the plan each iteration.
-        any_pdd = any(
-            getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states
-        )
+        any_pdd = any(getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states)
         # any_pdd forces the per-request loop even for a single request: that
         # loop is the only path that calls arm_step before the forward, and a
         # PDD head left on its default (un-armed) plan silently runs head 0
         # for every step instead of the per-step fused bank.
         if any_pdd or (
-            len(batch_states) > 1
-            and (mixed_transformers or not self._packed_batch_supported(transformers[0]))
+            len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0]))
         ):
             if any_pdd and not mixed_transformers:
                 logger.warning_once(
@@ -3109,6 +3102,12 @@ class MiniMaxH3Pipeline(
                 pdd_adapter = batch_states[index].extra.get(_STEP_PDD_ADAPTER)
                 if pdd_adapter is not None:
                     pdd_adapter.arm_step(transformers[index], batch_states[index].step_index)
+                elif any_pdd:
+                    # A preceding PDD row may have armed this same DiT.
+                    for head_name in ("video_out", "audio_out"):
+                        head = getattr(transformers[index].final_layer, head_name, None)
+                        if isinstance(head, PDDParallelHead):
+                            head.reset_plan()
                 forward_kwargs = branch.forward_kwargs(
                     video_rows=video_rows[index],
                     audio_rows=audio_rows[index],

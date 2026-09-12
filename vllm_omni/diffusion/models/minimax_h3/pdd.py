@@ -174,6 +174,8 @@ _PDD_TRUNK_TARGET_DIMS = {
     "ff.net.0.proj": (_PDD_HIDDEN_SIZE, 2 * _PDD_FFN_HIDDEN_SIZE),
     "ff.net.2": (_PDD_FFN_HIDDEN_SIZE, _PDD_HIDDEN_SIZE),
 }
+
+
 def _build_trunk_raw_targets() -> frozenset[str]:
     # DiT blocks (50) have all 7 targets (incl. adaln_proj.linear). Token
     # refiner blocks (2) are plain pre-norm blocks (MiniMaxH3TokenRefinerBlock)
@@ -243,9 +245,7 @@ def _pdd_weights_mapper(dit_component: str) -> WeightsMapper:
 _PDD_TRUNK_TARGET_PATTERN = _trunk_target_pattern("transformer")
 _PDD_WEIGHTS_MAPPER = _pdd_weights_mapper("transformer")
 # After substring remap, the valid leaf target names on the vllm-omni side.
-_PDD_VALID_VLLM_LEAVES = frozenset(
-    {"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2", "linear"}
-)
+_PDD_VALID_VLLM_LEAVES = frozenset({"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2", "linear"})
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +322,7 @@ class PDDConfig:
         return _trunk_target_pattern(self.dit_component)
 
     def plans(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return _build_pdd_plans(
-            self.num_steps, self.block_size, self.video_shift, self.audio_shift
-        )
+        return _build_pdd_plans(self.num_steps, self.block_size, self.video_shift, self.audio_shift)
 
 
 def _parse_pdd_metadata(
@@ -353,17 +351,13 @@ def _parse_pdd_metadata(
     rank = _get_int("lora_rank", _PDD_RANK)
     alpha = _get_float("lora_alpha", _PDD_ALPHA)
     if block_size < 1 or num_steps % block_size != 0:
-        raise ValueError(
-            f"pdd_num_steps={num_steps} must be divisible by pdd_block_size={block_size}"
-        )
+        raise ValueError(f"pdd_num_steps={num_steps} must be divisible by pdd_block_size={block_size}")
     if rank <= 0 or alpha <= 0:
         raise ValueError(f"PDD rank/alpha must be positive, got r={rank} alpha={alpha}")
     # Sanity-check the target list mentions adaln (older/different LoRA would be a red flag)
     targets = raw.get("lora_targets", "")
     if "adaln_proj.linear" not in targets:
-        raise ValueError(
-            f"PDD artifact must target adaln_proj.linear; got lora_targets={targets!r}"
-        )
+        raise ValueError(f"PDD artifact must target adaln_proj.linear; got lora_targets={targets!r}")
     if variant is None:
         variant = _PDD_VARIANTS_BY_NAME["ref2va"]
     return PDDConfig(
@@ -407,7 +401,11 @@ class PDDParallelHead(nn.Module):
     def __init__(self, source: nn.Module, num_steps: int) -> None:
         super().__init__()
         self.num_steps = num_steps
-        self.in_features = int(source.input_size_per_partition) if hasattr(source, "input_size_per_partition") else int(source.in_features)
+        self.in_features = (
+            int(source.input_size_per_partition)
+            if hasattr(source, "input_size_per_partition")
+            else int(source.in_features)
+        )
         # ColumnParallelLinear splits output dim across TP ranks.
         if hasattr(source, "output_size_per_partition"):
             self.out_features_local = int(source.output_size_per_partition)
@@ -437,21 +435,20 @@ class PDDParallelHead(nn.Module):
         init_w = source.weight.detach()
         if init_w.ndim == 2 and init_w.shape[0] > self.out_features_local:
             init_w = init_w.narrow(0, self.tp_rank * self.out_features_local, self.out_features_local)
-        self.weight = nn.Parameter(
-            init_w.to(torch.float32)[None].repeat(num_steps, 1, 1).clone()
-        )
+        self.register_buffer("base_weight", init_w.to(torch.float32).clone(), persistent=False)
+        self.weight = nn.Parameter(init_w.to(torch.float32)[None].repeat(num_steps, 1, 1).clone())
         if source.bias is not None:
             init_b = source.bias.detach()
             if init_b.shape[0] > self.out_features_local:
                 init_b = init_b.narrow(0, self.tp_rank * self.out_features_local, self.out_features_local)
-            self.bias = nn.Parameter(
-                init_b.to(torch.float32)[None].repeat(num_steps, 1).clone()
-            )
+            self.register_buffer("base_bias", init_b.to(torch.float32).clone(), persistent=False)
+            self.bias = nn.Parameter(init_b.to(torch.float32)[None].repeat(num_steps, 1).clone())
         else:
             self.register_parameter("bias", None)
+            self.register_buffer("base_bias", None, persistent=False)
 
-        # Default plan: use the first head (step 0). Pipeline arms before each
-        # forward; this default is only used between requests / tests.
+        # Keep the idle plan initialized, but use the saved base weights until
+        # the pipeline explicitly arms a distilled head before forward.
         # The buffer must live on the same device as the bank: heads are
         # installed after the model is already on GPU, so a default-device
         # (CPU) buffer would make the fusing einsum a cross-device bmm.
@@ -461,16 +458,17 @@ class PDDParallelHead(nn.Module):
             persistent=False,
         )
         self.plan[0, 0] = 1.0
+        self._use_base_head = True
 
     def set_plan(self, plan: torch.Tensor) -> None:
         if plan.ndim != 2 or plan.shape[1] != self.num_steps:
-            raise ValueError(
-                f"PDD plan must be (num_directions, {self.num_steps}), got {tuple(plan.shape)}"
-            )
+            raise ValueError(f"PDD plan must be (num_directions, {self.num_steps}), got {tuple(plan.shape)}")
         self.plan.copy_(plan.to(device=self.weight.device, dtype=torch.float32))
+        self._use_base_head = False
 
     def reset_plan(self) -> None:
-        """Return to the default head-0 plan (== the original base weight)."""
+        """Use the saved base head; artifact head 0 is also distilled."""
+        self._use_base_head = True
         self.plan.zero_()
         self.plan[0, 0] = 1.0
 
@@ -478,8 +476,11 @@ class PDDParallelHead(nn.Module):
         """Returns ``(output, None)`` to mimic ``ColumnParallelLinear(return_bias=True)``."""
         plan = self.plan
         # Fuse weights: (out_local, in_features)
-        w = torch.einsum("pn,noi->oi", plan, self.weight)
-        b = None if self.bias is None else torch.einsum("pn,no->o", plan, self.bias)
+        if self._use_base_head:
+            w, b = self.base_weight, self.base_bias
+        else:
+            w = torch.einsum("pn,noi->oi", plan, self.weight)
+            b = None if self.bias is None else torch.einsum("pn,no->o", plan, self.bias)
         # x is fp32 (final_layer.forward upcasts h before calling us).
         out_parallel = F.linear(x, w, b)
         if self.gather_output and self.tp_size > 1:
@@ -577,11 +578,13 @@ def _validate_and_convert_tensors(
         if name in ("proj_out.weight", "audio_proj_out.weight"):
             key = "video_out" if name == "proj_out.weight" else "audio_out"
             t = checkpoint.get_tensor(name)
-            expected = (cfg.num_steps, _PDD_VIDEO_OUT_DIM if key == "video_out" else _PDD_AUDIO_OUT_DIM, _PDD_HIDDEN_SIZE)
+            expected = (
+                cfg.num_steps,
+                _PDD_VIDEO_OUT_DIM if key == "video_out" else _PDD_AUDIO_OUT_DIM,
+                _PDD_HIDDEN_SIZE,
+            )
             if tuple(t.shape) != expected:
-                raise ValueError(
-                    f"PDD head {name} shape mismatch: expected {expected}, got {tuple(t.shape)}"
-                )
+                raise ValueError(f"PDD head {name} shape mismatch: expected {expected}, got {tuple(t.shape)}")
             head_weights[key] = t.to(torch.float32)
             continue
         if name in ("proj_out.bias", "audio_proj_out.bias"):
@@ -589,9 +592,7 @@ def _validate_and_convert_tensors(
             t = checkpoint.get_tensor(name)
             expected = (cfg.num_steps, _PDD_VIDEO_OUT_DIM if key == "video_out" else _PDD_AUDIO_OUT_DIM)
             if tuple(t.shape) != expected:
-                raise ValueError(
-                    f"PDD head bias {name} shape mismatch: expected {expected}, got {tuple(t.shape)}"
-                )
+                raise ValueError(f"PDD head bias {name} shape mismatch: expected {expected}, got {tuple(t.shape)}")
             head_biases[key] = t.to(torch.float32)
             continue
 
@@ -635,9 +636,7 @@ def _validate_and_convert_tensors(
         input_dim, output_dim = _PDD_TRUNK_TARGET_DIMS[suffix]
         expected_shape = (cfg.rank, input_dim) if side == "a" else (output_dim, cfg.rank)
         if tuple(tensor.shape) != expected_shape:
-            raise ValueError(
-                f"PDD tensor {name} shape {tuple(tensor.shape)} != expected {expected_shape}"
-            )
+            raise ValueError(f"PDD tensor {name} shape {tuple(tensor.shape)} != expected {expected_shape}")
 
         # Mirror the turbo gate/value swap for fc1 (ff.net.0.proj). The base
         # checkpoint chunks weight as (gate, up) and stores them shard-id 0/1,
@@ -654,13 +653,9 @@ def _validate_and_convert_tensors(
     missing = sorted(_PDD_TRUNK_RAW_TARGETS - raw_targets)
     unexpected = sorted(raw_targets - _PDD_TRUNK_RAW_TARGETS)
     if missing:
-        raise ValueError(
-            f"PDD trunk is missing {len(missing)} expected targets, e.g. {missing[:5]}"
-        )
+        raise ValueError(f"PDD trunk is missing {len(missing)} expected targets, e.g. {missing[:5]}")
     if unexpected:
-        raise ValueError(
-            f"PDD trunk has {len(unexpected)} unexpected targets, e.g. {unexpected[:5]}"
-        )
+        raise ValueError(f"PDD trunk has {len(unexpected)} unexpected targets, e.g. {unexpected[:5]}")
     for key in ("video_out", "audio_out"):
         if key not in head_weights:
             raise ValueError(f"PDD artifact missing head bank for {key}")
@@ -707,9 +702,7 @@ class PDDAdapter:
         this *immediately before* the forward that consumes step ``k``.
         """
         if not (0 <= step_index < self.config.nfe):
-            raise ValueError(
-                f"PDD step index {step_index} out of range [0, {self.config.nfe})"
-            )
+            raise ValueError(f"PDD step index {step_index} out of range [0, {self.config.nfe})")
         fl = getattr(transformer, "final_layer", None)
         if fl is None:
             return
@@ -722,7 +715,7 @@ class PDDAdapter:
         a_head.set_plan(self.audio_plans[step_index : step_index + 1].to(device=device))
 
     def disarm(self, transformer: nn.Module) -> None:
-        """Reset a transformer's PDD heads to the default (identity) plan.
+        """Restore a transformer's saved base heads.
 
         Call on deactivation: heads stay installed as ``PDDParallelHead``
         (never swapped back to plain ``ColumnParallelLinear``), so a later
@@ -832,10 +825,7 @@ def load_minimax_h3_pdd_lora(
     with safe_open(lora_file, framework="pt", device="cpu") as checkpoint:
         metadata = checkpoint.metadata() or {}
         key_format = metadata.get("key_format")
-        tagged_as_pdd = (
-            key_format in _PDD_VARIANTS_BY_KEY_FORMAT
-            or lora_file.name in _PDD_VARIANTS_BY_FILENAME
-        )
+        tagged_as_pdd = key_format in _PDD_VARIANTS_BY_KEY_FORMAT or lora_file.name in _PDD_VARIANTS_BY_FILENAME
         if not _has_pdd_head_bank(checkpoint):
             if tagged_as_pdd:
                 raise ValueError(
