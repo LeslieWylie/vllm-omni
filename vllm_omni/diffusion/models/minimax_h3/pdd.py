@@ -479,8 +479,8 @@ class PDDParallelHead(nn.Module):
         if self._use_base_head:
             w, b = self.base_weight, self.base_bias
         else:
-            w = torch.einsum("pn,noi->oi", plan, self.weight)
-            b = None if self.bias is None else torch.einsum("pn,no->o", plan, self.bias)
+            w = torch.einsum("sn,noi->oi", plan, self.weight)
+            b = None if self.bias is None else torch.einsum("sn,no->o", plan, self.bias)
         # x is fp32 (final_layer.forward upcasts h before calling us).
         out_parallel = F.linear(x, w, b)
         if self.gather_output and self.tp_size > 1:
@@ -816,7 +816,7 @@ def load_minimax_h3_pdd_lora(
     Raises ``ValueError`` on any shape / metadata / target-set mismatch, on an
     artifact whose variant cannot be determined, and on a partition that does
     not hold the DiT the artifact was distilled for -- these are hard errors
-    because a mis-bound or silently truncated PDD artifact produces corrupted
+    because an incorrectly bound or silently truncated PDD artifact produces corrupted
     videos, not load failures.
     """
     lora_file = _select_pdd_file(lora_path)

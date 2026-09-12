@@ -706,3 +706,38 @@ def test_validate_pdd_sampling_rejects_a_non_unit_lora_scale():
     )
     with pytest.raises(OmniClientError, match="lora_scale=1.0"):
         MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling, "ref2va")
+
+
+@pytest.mark.parametrize("evict", [False, True])
+def test_manager_removal_releases_pdd_banks(evict):
+    """Exercise explicit removal and the LRU entrypoint, not cleanup directly."""
+    import weakref
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline._ensure_pdd_bookkeeping()
+    bank = torch.ones(4)
+    bank_ref = weakref.ref(bank)
+    pipeline._pdd_adapters[1] = {"head_weights": bank}
+    pipeline._pdd_adapter_ids.add(1)
+    del bank
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline = pipeline
+    manager.max_cached_adapters = 1
+    manager._registered_adapters = {1: SimpleNamespace(id=1)}
+    manager._active_adapter_id = None
+    manager._adapter_scales = {1: 1.0}
+    manager._adapter_access_order = OrderedDict([(1, 0)])
+    manager._pinned_adapters = set()
+    if evict:
+        manager._evict_for_new_adapter()
+    else:
+        assert manager.remove_adapter(1)
+    assert bank_ref() is None
+    assert not pipeline._pdd_adapters
+    assert not pipeline._pdd_adapter_ids
+    assert not manager._registered_adapters
