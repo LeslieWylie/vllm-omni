@@ -994,28 +994,30 @@ class MiniMaxH3Pipeline(
         would corrupt every fl2va/t2va request.
         """
         adapter = self._pdd_active_adapters.get(lora_id)
-        if adapter is not None:
-            return adapter
         info = self._pdd_adapters[lora_id]
         cfg: PDDConfig = info["cfg"]
-        v_plans, a_plans = cfg.plans()
-        adapter = PDDAdapter(
-            config=cfg,
-            lora_id=lora_id,
-            video_plans=v_plans,
-            audio_plans=a_plans,
-        )
+        if adapter is None:
+            v_plans, a_plans = cfg.plans()
+            adapter = PDDAdapter(
+                config=cfg,
+                lora_id=lora_id,
+                video_plans=v_plans,
+                audio_plans=a_plans,
+            )
         dit = getattr(self, cfg.dit_component, None)
         if dit is None:
             raise OmniClientError(
                 f"MiniMax-H3 PDD {cfg.variant} artifact targets {cfg.dit_component!r}, "
                 f"absent from a {self.partition!r} deployment"
             )
+        if getattr(dit, "_pdd_adapter", None) is adapter:
+            return adapter
         # Only install if this DiT hasn't had heads replaced by this adapter
         # already (possible on re-activation after deactivation).
         if not isinstance(dit.final_layer.video_out, PDDParallelHead):
             adapter.install_heads(dit)
         adapter.load_head_bank(dit, info["head_weights"], info["head_biases"])
+        dit._pdd_adapter = adapter
         self._pdd_active_adapters[lora_id] = adapter
         return adapter
 
@@ -1037,8 +1039,24 @@ class MiniMaxH3Pipeline(
             adapters = [adapter] if adapter is not None else []
         for adapter in adapters:
             dit = getattr(self, adapter.config.dit_component, None)
-            if dit is not None:
+            if dit is not None and getattr(dit, "_pdd_adapter", None) is adapter:
                 adapter.disarm(dit)
+                dit._pdd_adapter = None
+
+    @staticmethod
+    def _reset_pdd_heads(transformer: nn.Module) -> None:
+        final_layer = getattr(transformer, "final_layer", None)
+        for name in ("video_out", "audio_out"):
+            head = getattr(final_layer, name, None)
+            if isinstance(head, PDDParallelHead):
+                head.reset_plan()
+
+    def _remove_diffusion_lora_adapter(self, adapter_id: int) -> None:
+        """Release model-owned banks when the manager removes or evicts an ID."""
+        self._ensure_pdd_bookkeeping()
+        self._deactivate_pdd_heads(adapter_id)
+        self._pdd_adapters.pop(adapter_id, None)
+        self._pdd_adapter_ids.discard(adapter_id)
 
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
@@ -2338,6 +2356,7 @@ class MiniMaxH3Pipeline(
 
             step_profiler = _pdd_arm
         else:
+            self._reset_pdd_heads(transformer)
             step_profiler = None
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
@@ -3057,6 +3076,10 @@ class MiniMaxH3Pipeline(
         # uses minimax_h3_denoise_loop directly with a step_profiler that arms
         # the plan each iteration.
         any_pdd = any(getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states)
+        if not any_pdd:
+            # Base-only batches may follow a completed PDD batch.
+            for transformer in transformers:
+                self._reset_pdd_heads(transformer)
         # any_pdd forces the per-request loop even for a single request: that
         # loop is the only path that calls arm_step before the forward, and a
         # PDD head left on its default (un-armed) plan silently runs head 0
@@ -3104,10 +3127,7 @@ class MiniMaxH3Pipeline(
                     pdd_adapter.arm_step(transformers[index], batch_states[index].step_index)
                 elif any_pdd:
                     # A preceding PDD row may have armed this same DiT.
-                    for head_name in ("video_out", "audio_out"):
-                        head = getattr(transformers[index].final_layer, head_name, None)
-                        if isinstance(head, PDDParallelHead):
-                            head.reset_plan()
+                    self._reset_pdd_heads(transformers[index])
                 forward_kwargs = branch.forward_kwargs(
                     video_rows=video_rows[index],
                     audio_rows=audio_rows[index],
