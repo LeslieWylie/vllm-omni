@@ -1,0 +1,50 @@
+{
+  "base_before vs base_after": {
+    "video": {
+      "first": {
+        "sha256": "5a09fb0a099de434959cefe208e8eb6fb98b8cfae9ec273ddc85caed65354209",
+        "decoded_bytes": 148561920
+      },
+      "second": {
+        "sha256": "5a09fb0a099de434959cefe208e8eb6fb98b8cfae9ec273ddc85caed65354209",
+        "decoded_bytes": 148561920
+      },
+      "byte_identical": true
+    },
+    "audio": {
+      "first": {
+        "sha256": "488addfd64cf9e35ebbe8e6744a9cd4a4991c24debe1c859d53748b96f5498b5",
+        "decoded_bytes": 1327104
+      },
+      "second": {
+        "sha256": "c1b69c45004eb8889e44b994e54a43a4ca71d36093e6f8964207688d08699a98",
+        "decoded_bytes": 1327104
+      },
+      "byte_identical": false
+    }
+  },
+  "pdd_first vs pdd_repeat": {
+    "video": {
+      "first": {
+        "sha256": "428d2af6515eff21932e298bb4cbdc4035e81b50823ba8c7f4ef9d1cb4b9b4c3",
+        "decoded_bytes": 148561920
+      },
+      "second": {
+        "sha256": "428d2af6515eff21932e298bb4cbdc4035e81b50823ba8c7f4ef9d1cb4b9b4c3",
+        "decoded_bytes": 148561920
+      },
+      "byte_identical": true
+    },
+    "audio": {
+      "first": {
+        "sha256": "c9eb85ab0f3837abaaf53cf9f1f251856d8f1465bcf1b8ad90104ecf0889225d",
+        "decoded_bytes": 1327104
+      },
+      "second": {
+        "sha256": "c9eb85ab0f3837abaaf53cf9f1f251856d8f1465bcf1b8ad90104ecf0889225d",
+        "decoded_bytes": 1327104
+      },
+      "byte_identical": true
+    }
+  }
+}
