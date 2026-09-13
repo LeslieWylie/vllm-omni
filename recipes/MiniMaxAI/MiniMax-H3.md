@@ -126,6 +126,42 @@ forward per request because fused head plans are per-request state. Distilled
 outputs are not expected to be pixel-identical to the base model; check action,
 identity, audio, and temporal continuity for the intended workload.
 
+### Current-revision GPU E2E smoke
+
+A September 13, 2026 (UTC+8) run exercised `b04bc33b3250` through
+`/v1/videos/sync` in one server process: base -> PDD -> base -> PDD.
+[Videos, exact metadata, comparisons, and launch profile](https://github.com/LeslieWylie/vllm-omni/tree/17275fa3b16e4328b697c29ab9fb9d9d04041b4c/benchmark-results/minimax-h3-pdd-20260913)
+are retained with the measured revision.
+
+Configuration: four H20 GPUs, BF16, TP4/USP1, text-encoder TP4 with layer
+offload, VAE tile/patch parallel4, eager, vLLM 0.29.0, PyTorch 2.13.0+cu130.
+An older service remained resident. The same three references, prompt and
+seed 42 were used for every request, requesting 5 seconds at 832x480.
+Base used 28 sigma points (27 NFE); PDD used 9 (8 NFE), scale 1.0.
+Both used video/audio shifts 12/3.
+
+| Request, in order | HTTP E2E seconds |
+| --- | ---: |
+| Base before PDD | 510.443 |
+| First PDD, including adapter load | 227.266 |
+| Base after PDD | 505.037 |
+| Repeated PDD, cached adapter | 169.850 |
+
+All four responses passed full video/audio decoding: 124 H.264 frames,
+832x480, 5.166667-second video and 5.175-second stereo 32 kHz AAC audio.
+The two base videos have byte-identical decoded frames, as do the two PDD
+videos. Repeated PDD audio is also byte-identical. Base audio differs
+(relative waveform L2 0.0912195); its cause was not isolated, so full baseline
+audio invariance is not established. Automatic transcription found the
+intended sentence and additional text in both initial outputs; exact speech
+compliance is not claimed.
+
+The last base/PDD pair is 2.973x for this sample. This is a request-mode
+integration smoke, not a general quality or dedicated-machine benchmark.
+GPU step-mode E2E, full-resolution performance, and broader task/quality
+coverage remain unverified. A 10-second 1344x768 attempt exceeded the memory
+available alongside the resident service.
+
 ### Historical runtime evidence
 
 An H20 deployment recorded a 10-second, 1344x768 Ref2VA workload with three
@@ -140,7 +176,8 @@ current revision**. Subsequent fixes changed trunk binding and head lifecycle,
 and the original comparison media are no longer at the report's paths. The
 September 12 audit recovered logs and reports, not a fresh matched A/B. Do not
 use the historical 2.9x ratio as a current-version performance guarantee.
-A GPU E2E run of the current revision remains required before acceptance.
+The smaller current-revision smoke above has a different configuration and
+must not be substituted for this historical full-resolution workload.
 
 ## Start a server
 
