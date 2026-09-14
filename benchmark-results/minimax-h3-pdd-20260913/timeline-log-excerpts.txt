@@ -1,0 +1,20 @@
+100%|██████████| 27/27 [07:59<00:00, 17.73s/it]
+100%|██████████| 27/27 [07:59<00:00, 17.78s/it]
+(APIServer pid=1683488) INFO 09-12 18:41:44 [stats.py:837] | e2e_total_ms | 509,957.158 |
+(APIServer pid=1683488) INFO 09-12 18:41:44 [stats.py:920] | diffusion_engine_exec_time_s    |     509.699 |
+(APIServer pid=1683488) INFO 09-12 18:41:44 [serving_video.py:579] Video response encoding (MP4 bytes): 339.48 ms
+100%|██████████| 8/8 [02:23<00:00, 17.96s/it]
+100%|██████████| 8/8 [02:23<00:00, 17.98s/it]
+(APIServer pid=1683488) INFO 09-12 18:45:31 [stats.py:837] | e2e_total_ms | 226,813.281 |
+(APIServer pid=1683488) INFO 09-12 18:45:31 [stats.py:920] | diffusion_engine_exec_time_s    |     226.565 |
+(APIServer pid=1683488) INFO 09-12 18:45:32 [serving_video.py:579] Video response encoding (MP4 bytes): 334.77 ms
+100%|██████████| 27/27 [07:58<00:00, 17.73s/it]
+100%|██████████| 27/27 [07:58<00:00, 17.74s/it]
+(APIServer pid=1683488) INFO 09-12 18:53:57 [stats.py:837] | e2e_total_ms | 504,602.174 |
+(APIServer pid=1683488) INFO 09-12 18:53:57 [stats.py:920] | diffusion_engine_exec_time_s    |     504.380 |
+(APIServer pid=1683488) INFO 09-12 18:53:57 [serving_video.py:579] Video response encoding (MP4 bytes): 318.08 ms
+100%|██████████| 8/8 [02:23<00:00, 17.95s/it]
+100%|██████████| 8/8 [02:23<00:00, 17.96s/it]
+(APIServer pid=1683488) INFO 09-12 18:56:47 [stats.py:837] | e2e_total_ms | 169,354.012 |
+(APIServer pid=1683488) INFO 09-12 18:56:47 [stats.py:920] | diffusion_engine_exec_time_s    |     169.127 |
+(APIServer pid=1683488) INFO 09-12 18:56:47 [serving_video.py:579] Video response encoding (MP4 bytes): 334.38 ms

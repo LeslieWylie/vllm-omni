@@ -1,0 +1,42 @@
+{
+  "measured_commit": "b04bc33b3250b1cbd6bb28cbcbafc3abe54a3815",
+  "method": "Engine and encoding from server counters; denoising from tqdm elapsed at one-second resolution; residuals by subtraction. Engine residual includes unprofiled adapter, text encoder, VAE and other pipeline work; no per-component attribution.",
+  "requests": [
+    {
+      "request": "base_before",
+      "http_e2e_s": 510.4429499269463,
+      "engine_execution_s": 509.699,
+      "denoising_approx_s": 479,
+      "other_engine_approx_s": 30.699000000000012,
+      "mp4_encoding_s": 0.33948,
+      "remaining_http_s": 0.4044699269462999
+    },
+    {
+      "request": "pdd_first",
+      "http_e2e_s": 227.26590245286934,
+      "engine_execution_s": 226.565,
+      "denoising_approx_s": 143,
+      "other_engine_approx_s": 83.565,
+      "mp4_encoding_s": 0.33476999999999996,
+      "remaining_http_s": 0.3661324528693431
+    },
+    {
+      "request": "base_after",
+      "http_e2e_s": 505.0370389770251,
+      "engine_execution_s": 504.38,
+      "denoising_approx_s": 478,
+      "other_engine_approx_s": 26.379999999999995,
+      "mp4_encoding_s": 0.31808,
+      "remaining_http_s": 0.3389589770250813
+    },
+    {
+      "request": "pdd_repeat",
+      "http_e2e_s": 169.8500292818062,
+      "engine_execution_s": 169.127,
+      "denoising_approx_s": 143,
+      "other_engine_approx_s": 26.12700000000001,
+      "mp4_encoding_s": 0.33438,
+      "remaining_http_s": 0.3886492818061912
+    }
+  ]
+}
