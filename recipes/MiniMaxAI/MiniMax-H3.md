@@ -147,6 +147,25 @@ Both used video/audio shifts 12/3.
 | Base after PDD | 505.037 |
 | Repeated PDD, cached adapter | 169.850 |
 
+The retained server counters provide the following E2E breakdown, in seconds:
+
+| Component | Base before | First PDD | Base after | Repeated PDD |
+| --- | ---: | ---: | ---: | ---: |
+| Diffusion engine execution | 509.699 | 226.565 | 504.380 | 169.127 |
+| MP4 response encoding | 0.339 | 0.335 | 0.318 | 0.334 |
+| Remaining HTTP time (by subtraction) | 0.404 | 0.366 | 0.339 | 0.389 |
+| **HTTP E2E total** | **510.443** | **227.266** | **505.037** | **169.850** |
+
+Within engine execution, the progress-bar elapsed times give approximately
+479 / 143 / 478 / 143 seconds for denoising (one-second resolution). The
+remaining engine time is approximately 30.7 / 83.6 / 26.4 / 26.1 seconds.
+These two parts are already included in the engine row above. Adapter loading,
+text encoding, VAE work and other pipeline work were not separately profiled;
+the first-PDD residual must not be interpreted as isolated adapter-load time.
+Remaining HTTP time includes server orchestration and response/client overhead.
+[Exact counters, derivation, and log excerpts](https://github.com/LeslieWylie/vllm-omni/tree/e04c24b3613f10c47ef84bbe22d443fd26d600bd/benchmark-results/minimax-h3-pdd-20260913)
+refer to the same measured revision `b04bc33b3250`; no new GPU run is implied.
+
 All four responses passed full video/audio decoding: 124 H.264 frames,
 832x480, 5.166667-second video and 5.175-second stereo 32 kHz AAC audio.
 The two base videos have byte-identical decoded frames, as do the two PDD
