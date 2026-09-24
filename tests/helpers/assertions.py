@@ -780,7 +780,11 @@ def _resolve_audio_transcript(
     audio_bytes = getattr(response, "audio_bytes", None)
     if not audio_bytes:
         return None
-    return convert_audio_bytes_to_text(audio_bytes, language=request_config.get("transcript_language"))
+    return convert_audio_bytes_to_text(
+        audio_bytes,
+        model_size=request_config.get("transcript_model", "small"),
+        language=request_config.get("transcript_language"),
+    )
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
@@ -954,6 +958,17 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     with :func:`assert_http_error`.
     """
     assert response.success, "The request failed."
+
+    if request_config.get("word_timestamps"):
+        timestamps = response.word_timestamps
+        assert isinstance(timestamps, list) and timestamps, "Expected nonempty X-Word-Timestamps"
+        previous_start = 0
+        for timestamp in timestamps:
+            assert isinstance(timestamp["word"], str) and timestamp["word"]
+            start, end = timestamp["start_ms"], timestamp["end_ms"]
+            assert isinstance(start, int) and isinstance(end, int)
+            assert previous_start <= start <= end
+            previous_start = start
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
     min_audio = request_config.get("min_audio_bytes")
