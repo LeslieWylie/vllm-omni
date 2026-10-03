@@ -131,7 +131,7 @@ class MiniMaxH3PDDLifecycleMixin:
         # Each release is distilled against one DiT: Ref2VA against
         # ``transformers_ref``, FL2VA against ``transformer`` (which also serves
         # t2va). Accepting the wrong one would bind the trunk delta and head
-        # bank to a DiT that never saw them, on a schedule pinned to 9 steps --
+        # bank to a DiT that never saw them, on a schedule pinned to 8 evaluations --
         # a silently bad video rather than an error. Refuse instead.
         if task is not None and task not in cfg.tasks:
             raise OmniClientError(
@@ -139,12 +139,12 @@ class MiniMaxH3PDDLifecycleMixin:
                 f"{sorted(cfg.tasks)}, got task={task!r}; use the {task} artifact or drop the "
                 "lora field to fall back to the undistilled schedule"
             )
-        sigma_points = sampling.num_inference_steps
-        if sigma_points != cfg.sigma_points:
+        num_steps = sampling.num_inference_steps
+        if num_steps != cfg.nfe:
             raise OmniClientError(
                 f"MiniMax-H3 PDD {cfg.variant} {cfg.nfe}-step requires "
-                f"num_inference_steps={cfg.sigma_points} "
-                f"({cfg.nfe} NFE + terminal zero), got {sigma_points}"
+                f"num_inference_steps={cfg.nfe} "
+                f"({cfg.nfe} denoiser evaluations, {cfg.sigma_points} sigma points), got {num_steps}"
             )
         try:
             video_shift = float(extra.get("flow_shift", self.default_video_shift))

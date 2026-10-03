@@ -69,8 +69,8 @@ def test_sigma_block_boundaries_match_9point_schedule():
     schedule -- this is the geometric condition that lets PDD's block-mean
     velocity fuse cleanly into one Euler step."""
     for shift in (12.0, 3.0):
-        s33 = minimax_h3_time_shift_sigmas(num_steps=33, shift_scale=shift)
-        s9 = minimax_h3_time_shift_sigmas(num_steps=9, shift_scale=shift)
+        s33 = minimax_h3_time_shift_sigmas(num_steps=32, shift_scale=shift)
+        s9 = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=shift)
         assert len(s33) == 33 and len(s9) == 9
         for i, (a, b) in enumerate(zip(s33[::4], s9)):
             assert abs(a - b) < 1e-6, f"shift={shift} boundary {i}: {a} vs {b}"
@@ -556,7 +556,7 @@ def test_release_directory_holding_both_variants_is_refused():
 
 def test_pdd_named_file_without_a_head_bank_raises_instead_of_falling_back(tmp_path):
     """A file the caller believes is PDD but which has no per-step bank must be
-    a hard error: the caller still pins 9 steps, and 9 undistilled steps is a
+    a hard error: the caller still pins 8 steps, and 8 undistilled steps is a
     wasted 3-minute request that returns garbage, not an error."""
     from safetensors.torch import save_file
 
@@ -664,7 +664,7 @@ def test_validate_pdd_sampling_rejects_a_task_the_artifact_was_not_distilled_for
     sampling = SimpleNamespace(
         lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
         extra_args={},
-        num_inference_steps=9,
+        num_inference_steps=8,
         lora_scale=1.0,
     )
     for bad_task in ("fl2va", "t2va"):
@@ -701,7 +701,7 @@ def test_validate_pdd_sampling_rejects_a_non_unit_lora_scale():
     sampling = SimpleNamespace(
         lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
         extra_args={},
-        num_inference_steps=9,
+        num_inference_steps=8,
         lora_scale=0.5,
     )
     with pytest.raises(OmniClientError, match="lora_scale=1.0"):
@@ -741,3 +741,23 @@ def test_manager_removal_releases_pdd_banks(evict):
     assert not pipeline._pdd_adapters
     assert not pipeline._pdd_adapter_ids
     assert not manager._registered_adapters
+
+
+@pytest.mark.parametrize("num_steps", [7, 9])
+def test_validate_pdd_sampling_rejects_wrong_evaluation_count(num_steps):
+    """The API counts evaluations; nine is the old sigma-boundary contract."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.errors import OmniClientError
+
+    cfg = PDDConfig()
+    fake = SimpleNamespace(_pdd_adapters={7: {"cfg": cfg}}, default_video_shift=12.0, default_audio_shift=3.0)
+    sampling = SimpleNamespace(
+        lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
+        extra_args={},
+        num_inference_steps=num_steps,
+        lora_scale=1.0,
+    )
+    with pytest.raises(OmniClientError, match="num_inference_steps=8"):
+        MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling)
