@@ -444,6 +444,7 @@ def extract_zimage_context(
         cap_pos_ids,
         x_inner_pad_mask,
         cap_inner_pad_mask,
+        _cap_feats_2,
     ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
     # Process image patches through embedder and noise refiner
@@ -1262,7 +1263,7 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
-    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
+    from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
