@@ -88,10 +88,10 @@ def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, 
     return branch, video_rows, audio_rows
 
 
-def _sigmas(num_points: int, shift: float) -> list[float]:
+def _sigmas(num_steps: int, shift: float) -> list[float]:
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-    return minimax_h3_time_shift_sigmas(num_steps=num_points, shift_scale=shift)
+    return minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift)
 
 
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
@@ -130,15 +130,16 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_step_execution_matches_request_mode_denoise_loop():
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
-    model = _SegmentMeanModel()
+    model = mocker.Mock(wraps=_SegmentMeanModel())
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
-    sigmas_video = _sigmas(6, 12.0)
-    sigmas_audio = _sigmas(6, 3.0)
+    sigmas_video = _sigmas(num_steps, 12.0)
+    sigmas_audio = _sigmas(num_steps, 3.0)
 
     reference_video, reference_audio = minimax_h3_denoise_loop(
         model=model,
@@ -151,6 +152,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
         device=torch.device("cpu"),
     )
 
+    assert model.call_count == num_steps
+    model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
     input_batch = SimpleNamespace(states=(state,))
@@ -161,10 +164,46 @@ def test_step_execution_matches_request_mode_denoise_loop():
         pipeline.step_scheduler(state, noise_pred)
         steps += 1
 
-    assert steps == len(sigmas_video) - 1
+    assert steps == num_steps
+    assert model.call_count == num_steps
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
+
+
+def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.platforms import current_omni_platform
+
+    # This test runs real packing/Euler updates on CPU with the small DiT above.
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
+    registry = RequestCancellationRegistry()
+    signal = registry.create("request")
+    steps = []
+
+    def cancel_after_first_step(step, video, audio):
+        steps.append(step)
+        registry.cancel(["request"])
+
+    try:
+        with request_cancellation_scope([signal]), pytest.raises(DiffusionRequestAbortedError):
+            minimax_h3_denoise_loop(
+                model=_SegmentMeanModel(),
+                positive=branch,
+                initial_video_rows=video_rows,
+                initial_audio_rows=audio_rows,
+                keyframe_cond_rows=None,
+                sigmas_video=_sigmas(6, 12.0),
+                sigmas_audio=_sigmas(6, 3.0),
+                device=torch.device("cpu"),
+                on_step=cancel_after_first_step,
+            )
+    finally:
+        registry.close()
+    assert steps == [0]
 
 
 def test_step_execution_matches_request_mode_with_latent_edits():
@@ -598,11 +637,13 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
     class HeadModel(_SegmentMeanModel):
         def __init__(self):
             super().__init__()
+            self.evaluations = 0
             self.final_layer = torch.nn.Module()
             self.final_layer.video_out = torch.nn.Linear(96, 96)
             self.final_layer.audio_out = torch.nn.Linear(32, 32)
 
         def __call__(self, **kwargs):
+            self.evaluations += 1
             video, audio = super().__call__(**kwargs)
             return self.final_layer.video_out(video)[0], self.final_layer.audio_out(audio)[0]
 
@@ -617,7 +658,7 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
             head.weight.add_(0.01)
             head.bias.add_(0.1)
     branch, video, audio = _make_branch(text_len=3, latent_t=1, latent_h=2, latent_w=2, audio_t=2, seed=5)
-    sv, sa = _sigmas(9, 12.0), _sigmas(9, 3.0)
+    sv, sa = _sigmas(8, 12.0), _sigmas(8, 3.0)
     pipeline = _step_pipeline(model)
     pipeline._resident_dit_layers_on_device = lambda **kwargs: nullcontext()
     pipeline.progress_bar = lambda **kwargs: nullcontext(SimpleNamespace(update=lambda: None))
@@ -646,7 +687,7 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
                 latent_w=2,
                 audio_t=2,
                 num_frames=5,
-                num_steps=9,
+                num_steps=8,
                 video_shift=12.0,
                 audio_shift=3.0,
                 base_schedule=None,
@@ -663,10 +704,13 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
             pipeline.step_scheduler(state, pred)
         return state.latents, state.extra[mod._STEP_AUDIO_ROWS]
 
+    assert len(sv) == len(sa) == 9
+    before = model.evaluations
     base_before = run(None)
     pdd_before = run(adapter)
     base_after = run(None)
     pdd_after = run(adapter)
+    assert model.evaluations - before == 4 * 8
     for expected, restored in zip(base_before, base_after):
         torch.testing.assert_close(expected, restored)
     for expected, restored in zip(pdd_before, pdd_after):

@@ -47,8 +47,8 @@ Design notes
 * Packed (co-batched) step execution is disabled while PDD is active because
   requests at different step indices need different fused heads; the
   pipeline's existing per-request fallback path handles this case.
-* The sigma schedule is the standard time-shifted grid with ``num_steps=9``
-  (8 NFE + terminal zero). The production defaults ``video_shift=12.0`` and
+* The sigma schedule is the standard time-shifted grid with ``num_steps=8``
+  (8 NFE bounded by 9 sigma points). The production defaults ``video_shift=12.0`` and
   ``audio_shift=3.0`` are already the released PDD shifts, and numerical
   checks (see docs/10) verified vllm-omni's schedule equals the PDD block
   boundaries to ~2.5e-8 -- the schedule itself needs no changes.
@@ -520,7 +520,7 @@ def _has_pdd_head_bank(checkpoint) -> bool:
     Deliberately *not* a filename test -- the released artifacts carry no
     ``key_format`` and a caller passing a correctly-shaped bank under any name
     must still take the PDD path. Falling through to the generic PEFT loader
-    would drop the head bank while the caller still pins 9 steps, which
+    would drop the head bank while the caller still pins 8 steps, which
     produces garbage rather than an error.
     """
     keys = set(checkpoint.keys())
@@ -832,7 +832,7 @@ def load_minimax_h3_pdd_lora(
                     f"{lora_file.name!r} is a MiniMax-H3 PDD release by name/key_format but has "
                     "no per-step head bank (proj_out.weight / audio_proj_out.weight, 3-D). "
                     "Refusing to fall back to the generic LoRA path: the caller still pins the "
-                    "distilled 9-step schedule, and 9 steps without the heads produces garbage."
+                    "distilled 8-step schedule, and 8 steps without the heads produces garbage."
                 )
             # Not a PDD artifact -- let the turbo / generic PEFT loader try.
             return None
