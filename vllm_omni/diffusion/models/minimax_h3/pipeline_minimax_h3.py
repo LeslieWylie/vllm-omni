@@ -159,8 +159,8 @@ from .packed_tokens import (
 from .pdd import PDDAdapter, PDDConfig
 from .pdd_lifecycle import MiniMaxH3PDDLifecycleMixin
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
 from .time_request import (
@@ -168,6 +168,7 @@ from .time_request import (
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
+from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -304,6 +305,8 @@ _REFINE_KEYFRAME_CONDITION = "minimax_h3_refine_keyframe_condition"
 _STEP_BRANCH = "minimax_h3_branch"
 _STEP_AUDIO_ROWS = "minimax_h3_audio_rows"
 _STEP_AUDIO_NOISE_PRED = "minimax_h3_audio_noise_pred"
+_STEP_VIDEO_SOLVER = "minimax_h3_video_solver"
+_STEP_AUDIO_SOLVER = "minimax_h3_audio_solver"
 _STEP_SIGMAS_VIDEO = "minimax_h3_sigmas_video"
 _STEP_SIGMAS_AUDIO = "minimax_h3_sigmas_audio"
 _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
@@ -666,6 +669,8 @@ class MiniMaxH3Pipeline(
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    # Set from --lora-path when it names a VDN-H3 checkpoint directory.
+    _vdn: VDNCheckpoint | None = None
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
 
     def _load_diffusion_lora_adapter(
@@ -1005,7 +1010,12 @@ class MiniMaxH3Pipeline(
                 diffusers_weights=modular,
             )
 
-        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
+        self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
+        if self._vdn is not None:
+            self._vdn.check_serving_contract(partition=self.partition, od_config=od_config)
+            # The hybrid modules must exist before the branch tensors stream in.
+            self.transformer.enable_vdn(self._vdn.config)
+        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer) if self._vdn is None else None
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
@@ -1026,7 +1036,7 @@ class MiniMaxH3Pipeline(
             "minimax_h3_adaln_cache_path",
             expected_partition,
             self._fasth3.source if self._fasth3 is not None else None,
-            eligible=transformer_quant_config is None and not modular,
+            eligible=transformer_quant_config is None and not modular and self._vdn is None,
         )
         if ref2va_model_path is not None:
             self._configure_adaln_sidecar(
@@ -1174,6 +1184,8 @@ class MiniMaxH3Pipeline(
             if component is None:
                 raise ValueError(f"MiniMax-H3 component {prefix.removesuffix('.')!r} is disabled in this deployment")
             stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix == "transformer." and self._vdn is not None:
+                stream = self._vdn.apply(stream)
             if prefix == "transformer." and self._fasth3 is not None:
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
@@ -1196,6 +1208,8 @@ class MiniMaxH3Pipeline(
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if self._vdn is not None:
+            self._vdn.validate(transformer_loaded, self.transformer.vdn_parameter_names())
         if self._fasth3 is not None:
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
@@ -1211,7 +1225,7 @@ class MiniMaxH3Pipeline(
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None
+        return self._fasth3 is not None or self._vdn is not None
 
     def _configure_adaln_sidecar(
         self,
@@ -1232,12 +1246,6 @@ class MiniMaxH3Pipeline(
         if path is None or not transformer.adaln_cache.max_bytes:
             return
         try:
-            # Compiled blocks bypass projection reuse. Reject before reading the
-            # sidecar so load completion cannot move an unused payload to GPU.
-            if not self.od_config.enforce_eager:
-                raise ValueError(
-                    "offline sidecars require --enforce-eager; compiled H3 blocks bypass cached projections"
-                )
             if not eligible or get_tensor_model_parallel_world_size() != 1:
                 raise ValueError("offline sidecar uses native BF16 TP1 math; use the default runtime cache here")
             sidecar = MiniMaxH3AdalnCache(transformer.arch, path=path, model_variant=variant)
@@ -1794,6 +1802,7 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sampler: str = "euler",
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
     ) -> dict[str, Any]:
@@ -1806,6 +1815,12 @@ class MiniMaxH3Pipeline(
         one: the rows start from those latents re-noised to the schedule
         position ``refine`` selects, and the returned schedules begin there.
         """
+        sampler = normalize_h3_sampler(sampler)
+        if sampler != "euler" and base_schedule is not None:
+            raise ValueError(
+                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
+                "use sampler='euler' for this schedule."
+            )
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
@@ -1991,6 +2006,7 @@ class MiniMaxH3Pipeline(
             "audio_anchor": (
                 None if audio_anchor is None else audio_anchor.to(device=self.device, dtype=torch.float32)
             ),
+            "sampler": sampler,
             "sigmas_video": video_sigmas,
             "sigmas_audio": audio_sigmas,
             "video_edit": video_edit,
@@ -2063,10 +2079,12 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sampler: str = "euler",
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
+            sampler=sampler,
             task=task,
             text_embeddings=text_embeddings,
             text_tags=text_tags,
@@ -2128,6 +2146,7 @@ class MiniMaxH3Pipeline(
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
+                    sampler=inputs["sampler"],
                     model=transformer,
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
@@ -2665,6 +2684,8 @@ class MiniMaxH3Pipeline(
                         video_shift=self.default_video_shift,
                         audio_shift=self.default_audio_shift,
                     )
+                if self._vdn is not None:
+                    self._vdn.check_request(sampling, task)
                 text_conditioning = self._extract_text_conditioning(raw_prompt)
                 if require_external_text and text_conditioning is None:
                     raise OmniClientError(
@@ -2816,6 +2837,8 @@ class MiniMaxH3Pipeline(
                 video_shift=self.default_video_shift,
                 audio_shift=self.default_audio_shift,
             )
+        if self._vdn is not None:
+            self._vdn.check_request(sampling, task)
         pdd_cfg: PDDConfig | None = None
         if has_pdd_lora:
             pdd_cfg = self._validate_pdd_sampling(sampling, task)
@@ -2903,6 +2926,12 @@ class MiniMaxH3Pipeline(
             num_steps = pdd_cfg.nfe
         else:
             base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
+        sampler = normalize_h3_sampler(extra.get("sampler"))
+        if sampler != "euler" and base_schedule is not None:
+            raise ValueError(
+                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
+                "use sampler='euler' for this schedule."
+            )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -2982,6 +3011,7 @@ class MiniMaxH3Pipeline(
             "keyframe_frame_indices": list(conditioning.keyframe_frame_indices) or None,
             "pad_seq_len": _resolve_pad_seq_len(extra.get("pad_seq_len")),
             "seed": int(sampling.seed if sampling.seed is not None else 42),
+            "sampler": sampler,
             "num_steps": num_steps,
             "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
@@ -3007,7 +3037,10 @@ class MiniMaxH3Pipeline(
     @staticmethod
     def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
         """Select the denoise-input arguments from a prepared request context."""
-        return {key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS}
+        return {
+            **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
+            "sampler": context.get("sampler", "euler"),
+        }
 
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
@@ -3215,6 +3248,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_COND_ANCHOR: cond_anchor,
                 _STEP_AUDIO_ANCHOR: audio_anchor,
+                _STEP_VIDEO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_video),
+                _STEP_AUDIO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_audio),
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
@@ -3401,7 +3436,7 @@ class MiniMaxH3Pipeline(
         return video_velocity
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Apply one Euler-eta0 update to this request's video and audio rows."""
+        """Apply one request-local solver update to the video and audio rows."""
         del kwargs
         # denoise_step() stages the audio half of this step's velocity; popping
         # it keeps a second step_scheduler() call from reusing a stale one.
@@ -3430,12 +3465,7 @@ class MiniMaxH3Pipeline(
                 noise_pred.float()[update],
                 schedule["t_video"],
             )
-        new_video = minimax_h3_euler_eta0_step(
-            video_rows[update],
-            x0_video,
-            sigma_curr=schedule["sigma_video"],
-            sigma_next=schedule["sigma_video_next"],
-        )
+        new_video = state.extra[_STEP_VIDEO_SOLVER].step(video_rows[update], x0_video, state.step_index)
         video_rows = video_rows.clone()
         video_rows[update] = new_video
         if cond_anchor is not None:
@@ -3454,12 +3484,7 @@ class MiniMaxH3Pipeline(
                 audio_noise_pred.float()[audio_update],
                 schedule["t_audio"],
             )
-        new_audio = minimax_h3_euler_eta0_step(
-            audio_rows[audio_update],
-            x0_audio,
-            sigma_curr=schedule["sigma_audio"],
-            sigma_next=schedule["sigma_audio_next"],
-        )
+        new_audio = state.extra[_STEP_AUDIO_SOLVER].step(audio_rows[audio_update], x0_audio, state.step_index)
         audio_rows = audio_rows.clone()
         audio_rows[audio_update] = new_audio if branch.locked_audio_rows is None else branch.locked_audio_rows
         if audio_anchor is not None:

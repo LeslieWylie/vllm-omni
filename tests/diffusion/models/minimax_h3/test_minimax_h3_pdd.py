@@ -761,3 +761,25 @@ def test_validate_pdd_sampling_rejects_wrong_evaluation_count(num_steps):
     )
     with pytest.raises(OmniClientError, match="num_inference_steps=8"):
         MiniMaxH3Pipeline._validate_pdd_sampling(fake, sampling)
+
+
+@pytest.mark.parametrize("sampler", [None, "euler", "res_multistep", "unknown"])
+def test_pdd_sampling_preserves_the_distilled_euler_contract(sampler):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.pdd_lifecycle import MiniMaxH3PDDLifecycleMixin
+    from vllm_omni.errors import OmniClientError
+
+    cfg = PDDConfig()
+    fake = SimpleNamespace(_pdd_adapters={7: {"cfg": cfg}}, default_video_shift=12.0, default_audio_shift=3.0)
+    sampling = SimpleNamespace(
+        lora_request=LoRARequest(lora_int_id=7, lora_name="pdd", lora_path=str(PDD_CKPT)),
+        extra_args={"sampler": sampler},
+        num_inference_steps=8,
+        lora_scale=1.0,
+    )
+    if sampler in (None, "euler"):
+        assert MiniMaxH3PDDLifecycleMixin._validate_pdd_sampling(fake, sampling, "ref2va") is cfg
+    else:
+        with pytest.raises(OmniClientError, match="sampler"):
+            MiniMaxH3PDDLifecycleMixin._validate_pdd_sampling(fake, sampling, "ref2va")

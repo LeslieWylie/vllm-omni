@@ -14,6 +14,7 @@ from torch import nn
 from vllm_omni.errors import OmniClientError
 
 from .pdd import PDDAdapter, PDDConfig, PDDParallelHead, load_minimax_h3_pdd_lora
+from .sampling import normalize_h3_sampler
 
 if TYPE_CHECKING:
     from vllm.lora.lora_model import LoRAModel
@@ -116,6 +117,15 @@ class MiniMaxH3PDDLifecycleMixin:
     def _validate_pdd_sampling(self, sampling: Any, task: str | None = None) -> PDDConfig:
         extra = sampling.extra_args or {}
         cfg = self._pdd_adapters[sampling.lora_request.lora_int_id]["cfg"]
+        try:
+            sampler = normalize_h3_sampler(extra.get("sampler"))
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+        # The parallel head bank fuses four trained Euler updates per call.
+        # A multistep solver would reinterpret this fused velocity using a
+        # denoised history the artifact was never trained against.
+        if sampler != "euler":
+            raise OmniClientError(f"MiniMax-H3 PDD {cfg.variant} requires sampler='euler', got {sampler!r}")
         # The head bank is swapped in at full strength (load_head_bank has no
         # scale knob); only the trunk LoRA delta honors lora_scale. A
         # fractional scale would silently blend a scaled trunk with an
