@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
@@ -113,15 +113,24 @@ class OmniMsgpackEncoder:
 
     def _encode_pil_image(self, img: Image.Image) -> dict[str, Any]:
         """Encode PIL.Image to dict."""
-        arr = np.asarray(img, dtype=np.uint8)
-        if not arr.flags.c_contiguous:
-            arr = np.ascontiguousarray(arr)
-        return {
+        img.load()
+        shape = [img.height, img.width]
+        if len(img.getbands()) > 1:
+            shape.append(len(img.getbands()))
+        result: dict[str, Any] = {
             _PIL_IMAGE_MARKER: True,
             "mode": img.mode,
-            "shape": list(arr.shape),
-            "data": arr.tobytes(),
+            # Retain shape for older decoders of ordinary 8-bit images.
+            "shape": shape,
+            "size": list(img.size),
+            "data": img.tobytes(),
         }
+        if img.palette is not None:
+            palette_mode, palette_data = img.palette.getdata()
+            result["palette"] = {"mode": palette_mode, "data": bytes(palette_data)}
+        if "transparency" in img.info:
+            result["transparency"] = img.info["transparency"]
+        return result
 
     def _encode_request_output(self, obj: RequestOutput) -> dict[str, Any]:
         """Encode RequestOutput to dict.
@@ -300,10 +309,20 @@ class OmniMsgpackDecoder:
     def _decode_pil_image(self, obj: dict[str, Any]) -> Image.Image:
         """Decode dict to PIL.Image."""
         mode = obj["mode"]
-        shape = obj["shape"]
         data = obj["data"]
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(shape)
-        return Image.fromarray(arr, mode=mode)
+        if "size" in obj:
+            img = Image.frombytes(mode, tuple(obj["size"]), data)
+        else:
+            # Read packets produced before native PIL byte serialization.
+            arr = np.frombuffer(data, dtype=np.uint8).reshape(obj["shape"])
+            img = Image.fromarray(arr, mode=mode)
+        if "palette" in obj:
+            palette = obj["palette"]
+            img.putpalette(palette["data"], rawmode=palette["mode"])
+        if "transparency" in obj:
+            transparency = obj["transparency"]
+            img.info["transparency"] = tuple(transparency) if isinstance(transparency, list) else transparency
+        return img
 
     def _decode_completion_output(self, obj: dict[str, Any]) -> CompletionOutput:
         """Decode dict to CompletionOutput using msgspec.convert."""
