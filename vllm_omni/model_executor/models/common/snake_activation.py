@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Shared Snake/SnakeBeta activations for speech decoders.
 
@@ -103,13 +103,17 @@ class SnakeBeta(nn.Module):
 
     @property
     def _cached(self):
-        return self._exp_alpha is not None
+        return self._exp_alpha is not None and self._inv_beta is not None
 
     def forward(self, hidden_states):
         """SnakeBeta := x + 1/b * sin^2(x*a)"""
         if hidden_states.is_cuda and not torch.is_grad_enabled() and self._init_triton():
             try:
                 return self._triton_forward(hidden_states)
+            except (MemoryError, torch.OutOfMemoryError):
+                # Memory pressure is transient, not evidence of a broken kernel.
+                # Let the request fail rather than allocate again in eager mode.
+                raise
             except Exception:
                 logger.warning("Triton SnakeBeta failed, falling back to eager", exc_info=True)
                 SnakeBeta._triton_kernel = False
