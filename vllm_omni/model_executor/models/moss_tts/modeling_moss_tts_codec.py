@@ -802,6 +802,7 @@ class MossTTSCodecDecoder(nn.Module):
                 sample_rate=self._sr_tensor,
                 device=next(self._codec.parameters()).device,
                 gate_main=bool(self._connector_int("codec_first_chunk_gate", default=0)),
+                max_active_streams=self._connector_int("codec_first_chunk_max_active_streams", default=0),
             )
             logger.info(
                 "MOSS-TTS codec first-chunk fast path ready: B=%s T=%d",
@@ -1192,7 +1193,7 @@ class MossTTSCodecDecoder(nn.Module):
             logger.info("Enabled codec attention backend=%s", attention_backend)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
-            lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+            lut_dtype = torch.bfloat16 if device.type in ("cuda", "npu") else torch.float32
             build_decode_lut(self._n_vq, dtype=lut_dtype)
             lut = codec.quantizer._decode_lut
             logger.info(
