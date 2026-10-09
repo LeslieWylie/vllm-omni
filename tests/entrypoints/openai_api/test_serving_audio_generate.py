@@ -95,7 +95,7 @@ def test_app():
     async def patched_create_audio_generate(*args, **kwargs):
         return await original_fn(*args, **kwargs)
 
-    patched_create_audio_generate.__signature__ = new_sig
+    setattr(patched_create_audio_generate, "__signature__", new_sig)
     server.create_audio_generate = patched_create_audio_generate
 
     app = FastAPI()
@@ -286,19 +286,18 @@ class TestParameterWiring:
         assert sp.num_inference_steps == 200
 
     @pytest.mark.asyncio
-    async def test_seed_creates_generator(self, server_and_engine):
+    @pytest.mark.parametrize("seed", [0, 42])
+    async def test_seed_forwarded_without_frontend_generator(self, server_and_engine, seed, mocker):
         server, engine = server_and_engine
-        req = OpenAICreateAudioGenerateRequest(input="test", seed=42)
+        req = OpenAICreateAudioGenerateRequest(input="test", seed=seed)
+        frontend_rng = mocker.patch("torch.Generator", side_effect=RuntimeError("API process has no GPU runtime"))
 
-        with patch("vllm_omni.entrypoints.openai.serving_audio_generate.torch") as mock_torch:
-            mock_gen = MagicMock()
-            mock_gen.manual_seed.return_value = mock_gen
-            mock_torch.Generator.return_value = mock_gen
+        await server.create_audio_generate(req)
 
-            await server.create_audio_generate(req)
-
-            mock_torch.Generator.assert_called_once()
-            mock_gen.manual_seed.assert_called_once_with(42)
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.seed == seed
+        assert sp.generator is None
+        frontend_rng.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_seed_none_skips_generator(self, server_and_engine):
@@ -308,6 +307,7 @@ class TestParameterWiring:
         await server.create_audio_generate(req)
 
         sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.seed is None
         assert sp.generator is None
 
     @pytest.mark.asyncio
@@ -557,7 +557,7 @@ class TestAudioGenerateAPI:
         assert response.headers["content-type"] == "audio/wav"
 
     def test_missing_input_rejected(self, client):
-        payload = {}
+        payload: dict[str, object] = {}
         response = client.post("/v1/audio/generate", json=payload)
         assert response.status_code == 422
 
