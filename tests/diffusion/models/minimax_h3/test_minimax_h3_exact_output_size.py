@@ -4,6 +4,7 @@
 
 import io
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -18,6 +19,58 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("height,width", [(1080, 1920), (1920, 1080)])
+@pytest.mark.parametrize("preencode", [False, True])
+def test_disaggregated_decoder_preserves_center_crop(height, width, preencode, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_decoder as decoder_module
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    shape = {
+        "height": (height + 31) // 32 * 32,
+        "width": (width + 31) // 32 * 32,
+        "output_height": height,
+        "output_width": width,
+        "preencode_mp4": preencode,
+    }
+    latent = torch.zeros(1)
+    source = object.__new__(MiniMaxH3Pipeline)
+    handoff = source._decoder_stage_output([latent], [latent], shape).output
+    options = handoff["metadata"]["minimax_h3_decode"]
+    offset = ((shape["height"] - height) // 2, (shape["width"] - width) // 2)
+    assert (options["height"], options["width"], options["crop_offset"]) == (height, width, offset)
+    latents = handoff["payload"]["trajectory"]["latents"]
+    request = SimpleNamespace(
+        prompts=[
+            {
+                "additional_information": {
+                    "minimax_h3_decode": {
+                        **options,
+                        "video_latents": latents["video"],
+                        "audio_latents": latents["audio"],
+                    }
+                }
+            }
+        ]
+    )
+    decoder = object.__new__(decoder_module.MiniMaxH3DecoderPipeline)
+    decoder.device = torch.device("cpu")
+    decoder.od_config = None
+    received = []
+
+    def decode(video, audio, **kwargs):
+        received.append(kwargs)
+        return b"mp4" if preencode else (torch.zeros(1, 3, 1, 2, 2), audio)
+
+    decoder.decode = decode
+    decoder.decode_to_mp4 = decode
+    decoder._offload_model_cpu_stage_output = lambda video: video
+    decoder._release_stage_cache = lambda: None
+    monkeypatch.setattr(decoder_module, "get_minimax_h3_post_process_func", lambda config: None)
+    decoder.forward(request)
+    assert len(received) == 1
+    assert (received[0]["height"], received[0]["width"], received[0]["crop_offset"]) == (height, width, offset)
 
 
 @pytest.mark.parametrize("height,width,canvas", [(1080, 1920, (1088, 1920)), (1920, 1080, (1920, 1088))])

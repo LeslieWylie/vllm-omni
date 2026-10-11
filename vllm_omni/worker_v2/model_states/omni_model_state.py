@@ -16,7 +16,7 @@ from __future__ import annotations
 import inspect
 import threading
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any, cast
 
@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -100,6 +101,7 @@ class OmniModelState(DefaultModelState):
     _eager_mtp = False
     _eager_fastpath = False
     _eager_rows: tuple[InputBatch, list[tuple[int, int, str, bool]], torch.Tensor] | None = None
+    preprocess_keeps_mm_inputs = False
     _first_audio_stream: torch.cuda.Stream | None = None
     # Set by the stage engine process when it can take one-request outputs directly.
     _first_audio_sender: Any = None
@@ -154,9 +156,24 @@ class OmniModelState(DefaultModelState):
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
 
+        # A preprocess model may also take native multimodal inputs (MiniCPM-o's
+        # duplex Thinker serves media chat). The encoder runner rewrites every
+        # active row of its buffer each step, so that buffer is the static one.
+        encoder_runner = getattr(self, "encoder_runner", None)
+        encoder_embeds = getattr(encoder_runner, "inputs_embeds", None)
+        self.preprocess_keeps_mm_inputs = bool(
+            self.has_preprocess
+            and self.supports_mm_inputs
+            and getattr(model, "preprocess_keeps_mm_inputs", False)
+            and isinstance(encoder_embeds, torch.Tensor)
+            and tuple(encoder_embeds.shape) == (self.max_num_tokens, self._embed_dim)
+        )
+
         # Static inputs_embeds buffer for FULL CUDA graph — preprocess fills it in-place each step.
         self._static_inputs_embeds: torch.Tensor | None = None
-        if self._embed_dim > 0:
+        if self.preprocess_keeps_mm_inputs:
+            self._static_inputs_embeds = encoder_embeds
+        elif self._embed_dim > 0:
             self._static_inputs_embeds = torch.zeros(
                 (self.max_num_tokens, self._embed_dim),
                 dtype=self.dtype,
@@ -447,6 +464,7 @@ class OmniModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
         ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         if (
             for_capture
@@ -471,6 +489,7 @@ class OmniModelState(DefaultModelState):
             kv_cache_config,
             for_capture=for_capture,
             ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
     def prepare_inputs_embeds(
@@ -657,6 +676,44 @@ class OmniModelState(DefaultModelState):
                 else:
                     del updates[key]
 
+    @staticmethod
+    def _split_settled_rows(
+        input_batch: InputBatch,
+        req_indices: list[int],
+        settled: dict[int, str],
+    ) -> tuple[list[tuple[int, int, int, str]], list[tuple[int, int]]] | None:
+        """Vectorized settled-row test of ``run_preprocess``.
+
+        In steady decode almost every row is settled: it schedules one token
+        and ``settled`` maps its slot to its request id. ``settled`` entries
+        are dropped together with the slot buffer, so comparing against the
+        row's request id equals the per-row ``buf["req_id"]`` test. Returns the
+        settled rows and the remaining ``(row, slot)`` pairs, both in row
+        order, or ``None`` when no row is settled.
+        """
+        n = input_batch.num_reqs
+        slots = np.asarray(input_batch.idx_mapping_np[:n])
+        owners = np.full(max(int(slots.max()), max(settled)) + 1, None, dtype=object)
+        owners[np.fromiter(settled.keys(), dtype=np.int64, count=len(settled))] = np.array(
+            list(settled.values()), dtype=object
+        )
+        req_ids = np.empty(n, dtype=object)
+        req_ids[:] = input_batch.req_ids[:n]
+        is_settled = (np.asarray(input_batch.num_scheduled_tokens[:n]) == 1) & (owners[slots] == req_ids)
+        if not is_settled.any():
+            return None
+        rows = np.flatnonzero(is_settled)
+        settled_rows = list(
+            zip(
+                rows.tolist(),
+                slots[rows].tolist(),
+                np.asarray(input_batch.query_start_loc_np[:n])[rows].tolist(),
+                req_ids[rows].tolist(),
+            )
+        )
+        remaining = [(i, req_indices[i]) for i in np.flatnonzero(~is_settled).tolist()]
+        return settled_rows, remaining
+
     def run_preprocess(
         self,
         input_batch: InputBatch,
@@ -681,7 +738,11 @@ class OmniModelState(DefaultModelState):
         if embeds is None:
             embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens])
             model_inputs["inputs_embeds"] = embeds
-        elif self._static_inputs_embeds is not None and embeds.data_ptr() == self._static_inputs_embeds.data_ptr():
+        elif (
+            not self.preprocess_keeps_mm_inputs
+            and self._static_inputs_embeds is not None
+            and embeds.data_ptr() == self._static_inputs_embeds.data_ptr()
+        ):
             # FULL graph replay requires a stable inputs_embeds address. Refresh
             # the active rows from the current token ids before model-specific
             # preprocessing; otherwise decode reuses embeddings left by the
@@ -694,7 +755,7 @@ class OmniModelState(DefaultModelState):
         mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]] = []
         prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None
 
-        req_indices = [int(input_batch.idx_mapping_np[i]) for i in range(input_batch.num_reqs)]
+        req_indices = np.asarray(input_batch.idx_mapping_np[: input_batch.num_reqs]).tolist()
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
 
         preprocess_entries: list[tuple[int, int, int, int, dict[str, Any], bool]] = []
@@ -704,7 +765,12 @@ class OmniModelState(DefaultModelState):
         # Declared identity decode has no per-row updates or hook work.
         skip_decode_rows = self._decode_preprocess_is_identity and not self._eager_mtp
         is_prefilling_np = getattr(input_batch, "is_prefilling_np", None) if skip_decode_rows else None
-        for i, req_idx in enumerate(req_indices):
+        rows: Iterable[tuple[int, int]] = enumerate(req_indices)
+        if settled and is_prefilling_np is None and not self._eager_state.has_pending_replay():
+            split = self._split_settled_rows(input_batch, req_indices, settled)
+            if split is not None:
+                settled_rows, rows = split
+        for i, req_idx in rows:
             if is_prefilling_np is not None and not is_prefilling_np[i]:
                 continue
             buf = self.intermediate_buffer.buffers[req_idx]
@@ -714,7 +780,8 @@ class OmniModelState(DefaultModelState):
             n_tok = int(input_batch.num_scheduled_tokens[i])
             if (
                 self._eager_mtp
-                and self.model.stream_decoder is not None
+                # Only the Qwen3-TTS Talker has an in-Talker streaming codec.
+                and getattr(self.model, "stream_decoder", None) is not None
                 and self._eager_state.replay_inputs(
                     buf["req_id"],
                     req_idx,
