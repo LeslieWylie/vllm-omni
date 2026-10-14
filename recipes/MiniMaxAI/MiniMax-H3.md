@@ -111,8 +111,68 @@ Use `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` for `ref2va` and
 `MiniMax-H3-FL2VA-Acc-8Step.safetensors` for `t2va`/`fl2va`. These artifacts
 have separate task-specific DiT weights; the loader rejects a task mismatch.
 Download the desired published artifact into `PDD_DIR` and start the server
-with dynamic LoRA enabled (`--enable-lora --max-lora-rank 64`). For example,
-with a server that has the Ref2VA partition loaded:
+with dynamic LoRA enabled (`--enable-lora --max-lora-rank 64`). The artifact
+path in a request is a path on the **server**, even when the client runs on
+another machine. Keep the published filename so the loader can identify the
+task-specific artifact.
+
+### Eight-GPU H20 Ref2VA server
+
+Install from a checkout containing `pdd.py`, `pdd_lifecycle.py`, and their
+pipeline integration, using the [CUDA source installation guide](../../docs/getting_started/installation/gpu.md#build-wheel-from-source).
+Record the checkout revision and installed package versions; installing a
+released wheel does not establish that it includes this PDD implementation.
+The historical H20 smoke below used vLLM 0.29.0 and PyTorch 2.13.0; it does
+not qualify newer dependency versions or the current checkout on H20.
+
+For **eight available H20 GPUs**, this starting configuration uses DiT
+TP2/Ulysses4, text-encoder TP8, and eight-way VAE tile parallelism. PDD's
+eight denoiser evaluations are independent of the number of GPUs. On four
+GPUs, use `--num-gpus 4 --tensor-parallel-size 4 --usp 1`, text-encoder TP4,
+and VAE parallel4, as in the historical smoke; select four visible devices.
+
+Use `FLASH_ATTN` with a compatible Hopper FlashAttention installation. The
+B300 `TRTLLM_ATTN` backend requires datacenter Blackwell and is unavailable
+on H20; see the [backend requirements](../../docs/user_guide/diffusion/attention_backends/trtllm.md#requirements).
+`TORCH_SDPA` is an alternative for an initial correctness check when
+FlashAttention is unavailable, with no performance equivalence implied.
+This example quantizes the DiT to FP8 while retaining the BF16 text encoder,
+and uses eager execution for the initial run.
+
+```bash
+export MODEL=MiniMaxAI/MiniMax-H3
+export PDD_DIR="${PWD}/pdd-adapters"
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs \
+  MiniMax-H3-Ref2VA-Acc-8Step.safetensors --local-dir "${PDD_DIR}"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=3600 \
+vllm serve "${MODEL}" --omni --host 127.0.0.1 --port 8000 \
+  --trust-remote-code --task-type ref2va \
+  --num-gpus 8 --tensor-parallel-size 2 --usp 4 --ring 1 \
+  --text-encoder-tp-size 8 \
+  --vae-patch-parallel-size 8 --vae-parallel-mode tile --vae-use-tiling \
+  --diffusion-quantization-config '{"transformer":{"method":"fp8"},"text_encoder":null}' \
+  --diffusion-attention-backend FLASH_ATTN --enforce-eager \
+  --lora-backend peft --enable-lora --max-lora-rank 64 \
+  --init-timeout 3600 --stage-init-timeout 3600
+```
+
+Keep the DiT resident: PDD rejects model-level or layerwise **DiT** offload.
+If the text encoder needs offload, select only that component with
+`--diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}'`.
+Available GPU memory, reference sizes, and output duration still determine
+whether a request fits. Begin with a five-second 832x480 request and one
+reference, then qualify the intended resolution and reference workload.
+The eight-GPU configuration above is a deployment starting point, not a new
+H20 performance or visual-quality result.
+
+### Send a PDD request
+
+Run the following on the server, or use the server's artifact path in the
+`lora` field when sending from another machine. In a new shell, set `PDD_DIR`
+to the same absolute directory used for the download above.
 
 ```bash
 export PDD_DIR=/absolute/path/to/pdd
@@ -120,7 +180,7 @@ curl --fail-with-body http://localhost:8000/v1/videos/sync \
   -F 'prompt=A person waves hello in a quiet room.' \
   -F 'input_references=@reference.png' \
   -F 'seconds=5' \
-  -F 'width=1344' -F 'height=768' \
+  -F 'width=832' -F 'height=480' \
   -F 'num_inference_steps=8' \
   -F 'seed=42' -F 'generate_sound=true' \
   -F 'extra_params={"task":"ref2va","aspect_ratio":"16:9","flow_shift":12.0,"audio_flow_shift":3.0}' \
@@ -204,7 +264,7 @@ current revision**. Subsequent fixes changed trunk binding and head lifecycle,
 and the original comparison media are no longer at the report's paths. The
 September 12 audit recovered logs and reports, not a fresh matched A/B. Do not
 use the historical 2.9x ratio as a current-version performance guarantee.
-The smaller current-revision smoke above has a different configuration and
+The smaller September 13 smoke above has a different configuration and
 must not be substituted for this historical full-resolution workload.
 
 ## Start a server
