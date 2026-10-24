@@ -105,7 +105,7 @@ class OmniModelConfig(ModelConfig):
          worker_type: Model Type, e.g., "ar" or "generation"
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
-             "audio", "latents"). If None, output type is inferred.
+             "audio", "latent", "token_ids"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
          task_type: Model-defined startup task type. Each model validates its
@@ -130,6 +130,7 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False

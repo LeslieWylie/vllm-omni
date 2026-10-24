@@ -97,7 +97,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "enable_multithread_weight_load",
         "env",
         "has_sampling_extra_args",
-        "log_level",
         "log_stats",
         "model_arch",
         "model_subdir",
@@ -227,7 +226,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 execution_type=StageExecutionType.LLM_AR,
                 requires_multimodal_data=True,
                 hf_config_name="thinker_config",
-                engine_output_type="hidden_states",
+                engine_output_type="latent",
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_subdir="ar-model",
                 tokenizer_subdir="ar-tokenizer",
@@ -239,7 +238,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -844,7 +843,13 @@ def _fake_model_root(pipeline, tmp_path):
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
+def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path, monkeypatch):
+    # Compare argument schemas without materializing model-specific checkpoints.
+    def _resolve_test_model_path(model, engine_args):
+        engine_args.pop("model_path_resolver", None)
+        return model
+
+    monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
