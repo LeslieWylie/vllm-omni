@@ -197,9 +197,8 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
 
 
 def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
-    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
-
     from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
     from vllm_omni.platforms import current_omni_platform
 
