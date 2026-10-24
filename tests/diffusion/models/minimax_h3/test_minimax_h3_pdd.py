@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_omni.diffusion.models.minimax_h3.pdd import (
+from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import (
     PDDAdapter,
     PDDConfig,
     PDDParallelHead,
@@ -106,179 +106,155 @@ def test_plan_matches_reference_implementation():
 # ---------------------------------------------------------------------------
 
 
-def test_parallel_head_default_plan_matches_source():
-    torch.manual_seed(0)
-    src = nn.Linear(5376, 96, bias=True).float()
-    head = PDDParallelHead(src, 32)
-    x = torch.randn(3, 5376)
-    out, extra_bias = head(x)
-    assert extra_bias is None
-    assert torch.allclose(out, src(x), atol=1e-5)
-
-
-def test_parallel_head_averaging_plan_is_manual_mean():
-    torch.manual_seed(1)
-    src = nn.Linear(5376, 32, bias=True).float()
-    head = PDDParallelHead(src, 32)
-    # Initialize the bank with distinct weights so averaging is observable.
-    head.weight.data = torch.randn_like(head.weight)
-    head.bias.data = torch.randn_like(head.bias)
-    plan = torch.zeros(1, 32)
-    plan[0, :4] = 0.25
-    head.set_plan(plan)
-    x = torch.randn(2, 5376)
-    w_mean = head.weight[:4].mean(0)
-    b_mean = head.bias[:4].mean(0)
-    assert torch.allclose(head(x)[0], F.linear(x, w_mean, b_mean), atol=1e-5)
-
-
-def test_parallel_head_reset_plan_restores_base_after_artifact_load():
-    """Regression: deactivation used to leave a fused (non-identity) plan in
-    place, so a later non-PDD request on the same DiT would silently keep
-    running through the last PDD step's fused head instead of the base
-    weight."""
+def test_parallel_head_base_and_explicit_adapter_selection():
     torch.manual_seed(2)
-    src = nn.Linear(5376, 32, bias=True).float()
-    head = PDDParallelHead(src, 32)
-    # Loading an artifact replaces ALL bank entries, including head 0.
-    head.weight.data.copy_(torch.randn_like(head.weight))
-    head.bias.data.copy_(torch.randn_like(head.bias))
-    plan = torch.zeros(1, 32)
-    plan[0, 1] = 1.0
-    head.set_plan(plan)
-    x = torch.randn(2, 5376)
-    assert not torch.allclose(head(x)[0], src(x), atol=1e-5)
-    head.reset_plan()
-    assert torch.allclose(head(x)[0], src(x), atol=1e-5)
+    source = nn.Linear(16, 4)
+    head = PDDParallelHead(source, 32)
+    plans, _ = _build_pdd_plans(32, 4, 12.0, 3.0)
+    weights = torch.randn(32, 4, 16)
+    biases = torch.randn(32, 4)
+    head.load_bank(1, weights, biases, plans)
+    head.load_bank(2, weights + 1, biases + 2, plans)
+    x = torch.randn(3, 16)
+    base = source(x)
+    first = head(x, 3, 1)[0]
+    expected = F.linear(x, torch.einsum("n,noi->oi", plans[3], weights), plans[3] @ biases)
+    torch.testing.assert_close(first, expected)
+    assert not torch.allclose(first, head(x, 3, 2)[0])
+    # A -> B -> A and Base never depend on the last adapter or step.
+    torch.testing.assert_close(head(x, 3, 1)[0], first)
+    torch.testing.assert_close(head(x)[0], base)
+    head.remove_bank(1)
+    with pytest.raises(KeyError):
+        head(x, 3, 1)
+    head.load_bank(1, weights + 3, biases + 4, plans)
+    assert not torch.allclose(head(x, 3, 1)[0], first)
+    torch.testing.assert_close(head(x)[0], base)
 
 
-def test_parallel_head_rejects_bad_plan_shape():
-    src = nn.Linear(16, 4, bias=True).float()
-    head = PDDParallelHead(src, 4)
-    with pytest.raises(ValueError):
-        head.set_plan(torch.zeros(1, 3))
+@pytest.mark.parametrize("step", [None, -1, 8, True])
+def test_parallel_head_rejects_invalid_explicit_step(step):
+    head = PDDParallelHead(nn.Linear(3, 2), 32)
+    plans, _ = _build_pdd_plans(32, 4, 12.0, 3.0)
+    head.load_bank(1, torch.zeros(32, 2, 3), torch.zeros(32, 2), plans)
+    with pytest.raises(ValueError, match="step"):
+        head(torch.ones(1, 3), step, 1)
 
 
-def test_parallel_head_no_bias_supported():
-    src = nn.Linear(16, 4, bias=False).float()
-    head = PDDParallelHead(src, 4)
-    assert head.bias is None
-    x = torch.randn(2, 16)
-    # Default plan is head 0; should match src(x).
-    assert torch.allclose(head(x)[0], src(x), atol=1e-6)
+def test_parallel_head_no_bias_and_bank_device():
+    source = nn.Linear(3, 2, bias=False)
+    head = PDDParallelHead(source, 32)
+    plans, _ = _build_pdd_plans(32, 4, 12.0, 3.0)
+    head.load_bank(1, source.weight.detach()[None].repeat(32, 1, 1), torch.zeros(32, 2), plans)
+    bank = head.banks["1"]
+    assert bank.bias is None
+    assert bank.plans.device == bank.weight.device == head.base_weight.device
+    torch.testing.assert_close(head(torch.ones(1, 3), 0, 1)[0], source(torch.ones(1, 3)))
 
 
-def test_parallel_head_plan_buffer_shares_weight_device():
-    """Regression: the plan buffer used to be created on the default (CPU)
-    device while the bank lives wherever the source layer already was.  On
-    GPU that made the fusing einsum a cross-device bmm, so every PDD request
-    died with "mat2 is on cuda:N, different from other tensors on cpu"."""
-    src = nn.Linear(16, 4, bias=True).float()
-    head = PDDParallelHead(src, 4)
-    assert head.plan.device == head.weight.device
+def test_parallel_head_keeps_existing_local_tp_shard():
+    source = nn.Linear(3, 2)
+    source.input_size_per_partition = 3
+    source.output_size_per_partition = 2
+    source.tp_rank, source.tp_size, source.gather_output = 1, 2, False
+    head = PDDParallelHead(source, 32)
+    torch.testing.assert_close(head.base_weight, source.weight)
+    plans, _ = _build_pdd_plans(32, 4, 12.0, 3.0)
+    weights, biases = torch.randn(32, 4, 3), torch.randn(32, 4)
+    head.load_bank(1, weights, biases, plans)
+    torch.testing.assert_close(head.banks["1"].weight, weights[:, 2:])
+    torch.testing.assert_close(head.banks["1"].bias, biases[:, 2:])
 
 
-def test_parallel_head_does_not_reshard_an_already_sharded_source():
-    """Regression: ColumnParallelLinear hands us the *local* shard already
-    ([out_local, in]), not the full [out, in].  A `>=` guard re-narrowed it at
-    offset tp_rank*out_local and blew past the end of the tensor."""
-
-    class FakeColumnParallel(nn.Module):
-        """Mimics a tp=2 rank-1 ColumnParallelLinear: weight is pre-sharded."""
-
-        def __init__(self, out_local: int, in_features: int) -> None:
-            super().__init__()
-            self.input_size_per_partition = in_features
-            self.output_size_per_partition = out_local
-            self.tp_rank = 1
-            self.tp_size = 2
-            self.gather_output = True
-            self.weight = nn.Parameter(torch.randn(out_local, in_features).float())
-            self.bias = nn.Parameter(torch.randn(out_local).float())
-
-    src = FakeColumnParallel(out_local=48, in_features=5376)
-    head = PDDParallelHead(src, 32)
-    assert tuple(head.weight.shape) == (32, 48, 5376)
-    assert tuple(head.bias.shape) == (32, 48)
-    # Every copy is initialized from the local shard verbatim.
-    assert torch.allclose(head.weight[0], src.weight)
-    assert torch.allclose(head.bias[0], src.bias)
-
-
-def test_install_heads_covers_every_dit_not_just_the_first():
-    """Regression: PDDAdapter carried a single ``_heads_installed`` bool, so in
-    the ``combined`` partition the second DiT (transformers_ref) silently kept
-    its plain ColumnParallelLinear and load_head_bank then tried to copy a
-    (32, out, in) bank into a 2-D weight."""
-
-    def _make_dit():
-        dit = nn.Module()
-        dit.final_layer = nn.Module()
-        dit.final_layer.video_out = nn.Linear(5376, 96, bias=True).float()
-        dit.final_layer.audio_out = nn.Linear(5376, 32, bias=True).float()
-        return dit
+def test_artifact_heads_cannot_replace_full_checkpoint_heads():
+    from types import SimpleNamespace
 
     cfg = PDDConfig()
-    vp, ap = cfg.plans()
-    adapter = PDDAdapter(config=cfg, lora_id=1, video_plans=vp, audio_plans=ap)
-    transformer, transformers_ref = _make_dit(), _make_dit()
-    for dit in (transformer, transformers_ref):
-        adapter.install_heads(dit)
-        assert isinstance(dit.final_layer.video_out, PDDParallelHead)
-        assert isinstance(dit.final_layer.audio_out, PDDParallelHead)
-
-    # And loading the bank into both must work (this is what used to raise).
-    head_weights = {
-        "video_out": torch.randn(cfg.num_steps, 96, 5376),
-        "audio_out": torch.randn(cfg.num_steps, 32, 5376),
-    }
-    head_biases = {
-        "video_out": torch.randn(cfg.num_steps, 96),
-        "audio_out": torch.randn(cfg.num_steps, 32),
-    }
-    for dit in (transformer, transformers_ref):
-        adapter.load_head_bank(dit, head_weights, head_biases)
-        assert torch.allclose(dit.final_layer.video_out.weight, head_weights["video_out"])
-        assert torch.allclose(dit.final_layer.audio_out.weight, head_weights["audio_out"])
-
-    # Re-installing is a no-op rather than wrapping a head inside a head.
-    adapter.install_heads(transformer)
-    assert torch.allclose(transformer.final_layer.video_out.weight, head_weights["video_out"])
+    adapter = PDDAdapter(cfg, 1, *cfg.plans())
+    model = SimpleNamespace(arch=SimpleNamespace(pdd_steps=32))
+    with pytest.raises(ValueError, match="checkpoint heads"):
+        adapter.install_heads(model)
 
 
-def test_disarm_restores_head0_plan_set_by_arm_step():
-    """Regression: deactivation cleared PDDAdapter's own bookkeeping but never
-    touched the installed heads' plan buffer, so a later request reusing this
-    DiT without the adapter (no-LoRA, Turbo, or a different PDD artifact)
-    would keep running through this adapter's last-armed per-step plan."""
+def test_full_checkpoint_grid_stays_independent():
+    from vllm_omni.diffusion.models.minimax_h3.pdd import pdd_sigmas
 
-    def _make_dit():
-        dit = nn.Module()
-        dit.final_layer = nn.Module()
-        dit.final_layer.video_out = nn.Linear(5376, 96, bias=True).float()
-        dit.final_layer.audio_out = nn.Linear(5376, 32, bias=True).float()
-        return dit
+    assert pdd_sigmas(12.0)[0] == pytest.approx(0.999)
+    assert minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=12.0)[0] == 1.0
 
-    cfg = PDDConfig()
-    vp, ap = cfg.plans()
-    adapter = PDDAdapter(config=cfg, lora_id=1, video_plans=vp, audio_plans=ap)
-    dit = _make_dit()
-    adapter.install_heads(dit)
-    adapter.arm_step(dit, 1)
-    default_plan = torch.zeros(1, cfg.num_steps)
-    default_plan[0, 0] = 1.0
-    assert not torch.allclose(dit.final_layer.video_out.plan, default_plan)
-    assert not torch.allclose(dit.final_layer.audio_out.plan, default_plan)
 
-    adapter.disarm(dit)
-    assert torch.allclose(dit.final_layer.video_out.plan, default_plan)
-    assert torch.allclose(dit.final_layer.audio_out.plan, default_plan)
+@pytest.mark.parametrize("step_execution", [False, True])
+def test_full_checkpoint_still_rejects_request_adapters(step_execution):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+    from vllm_omni.errors import OmniClientError
+
+    sampling = SimpleNamespace(
+        num_inference_steps=8, guidance_scale=1.0, timesteps=None, sigmas=None, extra_args={}, lora_request=None
+    )
+    spec = FastH3OmniCheckpointSpec()
+    spec.check_request(sampling, step_execution=step_execution)
+    sampling.lora_request = object()
+    with pytest.raises(OmniClientError, match="per-request LoRA"):
+        spec.check_request(sampling, step_execution=step_execution)
+
+
+@pytest.mark.parametrize("kind", ["base", "artifact", "full_checkpoint"])
+def test_final_layer_selects_the_requested_head_family(kind):
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3FinalLayer
+    from vllm_omni.diffusion.models.minimax_h3.pdd import MiniMaxH3PDDOutput
+
+    class AdaLN(nn.Module):
+        def forward(self, value):
+            return torch.zeros(1, 3), torch.zeros(1, 3)
+
+    class TupleLinear(nn.Linear):
+        def forward(self, value):
+            return super().forward(value), None
+
+    final = MiniMaxH3FinalLayer.__new__(MiniMaxH3FinalLayer)
+    nn.Module.__init__(final)
+    final.norm, final.adaln_proj = nn.Identity(), AdaLN()
+    final.pdd_steps = 32 if kind == "full_checkpoint" else None
+    for name in ("video_out", "audio_out"):
+        if kind == "full_checkpoint":
+            head = MiniMaxH3PDDOutput(3, 2, shift=12.0)
+            nn.init.normal_(head.weight)
+            nn.init.normal_(head.bias)
+        else:
+            head = TupleLinear(3, 2)
+            if kind == "artifact":
+                head = PDDParallelHead(head, 32)
+                plans, _ = _build_pdd_plans(32, 4, 12.0, 3.0)
+                head.load_bank(1, torch.randn(32, 2, 3), torch.randn(32, 2), plans)
+        setattr(final, name, head)
+    value = torch.randn(2, 3)
+    step = 6 if kind != "base" else None
+    adapter_id = 1 if kind == "artifact" else None
+    expected = []
+    for head in (final.video_out, final.audio_out):
+        result = (
+            head(value, step)
+            if kind == "full_checkpoint"
+            else (head(value, step, adapter_id)[0] if kind == "artifact" else head(value)[0])
+        )
+        expected.append(result)
+    actual = final(
+        value,
+        t_emb=torch.empty(0),
+        inverse_indices=torch.zeros(2, dtype=torch.long),
+        pdd_step=step,
+        pdd_adapter_id=adapter_id,
+    )
+    for found, wanted in zip(actual, expected):
+        torch.testing.assert_close(found, wanted)
 
 
 def test_diffuse_accepts_pdd_adapter_but_build_denoise_inputs_does_not():
     """Regression: ``forward`` passed ``pdd_adapter`` straight through to
     ``_build_denoise_inputs``, which has no such parameter.  ``diffuse`` owns
-    the argument (it steers per-step head arming); the input builder must not
+    the argument (it selects the request-owned adapter ID); the input builder must not
     see it."""
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _MINIMAX_H3_DENOISE_INPUT_KEYS,
@@ -348,7 +324,7 @@ def test_lora_model_from_tensors_accepts_pdd_trunk():
     from vllm.lora.lora_model import LoRAModel
     from vllm.lora.peft_helper import PEFTHelper
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd import (
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import (
         _PDD_ALPHA,
         _PDD_RANK,
         _PDD_TRUNK_TARGET_PATTERN,
@@ -451,7 +427,7 @@ FL2VA_CKPT = PDD_CKPT.with_name("MiniMax-H3-FL2VA-Acc-8Step.safetensors")
 
 
 def test_variant_registry_maps_each_release_to_its_own_dit():
-    from vllm_omni.diffusion.models.minimax_h3.pdd import (
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import (
         _PDD_VARIANTS_BY_NAME,
     )
 
@@ -484,7 +460,7 @@ def test_trunk_lora_keys_are_anchored_on_the_variants_own_dit(ckpt, partition, e
     and none may match the other DiT's."""
     import re
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _trunk_target_pattern
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _trunk_target_pattern
 
     req = LoRARequest(lora_int_id=9101, lora_name="pdd", lora_path=str(ckpt))
     loaded = load_minimax_h3_pdd_lora(partition=partition, lora_request=req, lora_path=str(ckpt), dtype=torch.bfloat16)
@@ -548,7 +524,7 @@ def test_fl2va_artifact_is_refused_on_a_ref2va_only_deployment():
 def test_release_directory_holding_both_variants_is_refused():
     """Silently picking one by iteration order would accelerate half the
     traffic with the wrong distillation."""
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _select_pdd_file
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _select_pdd_file
 
     with pytest.raises(ValueError, match="point lora.path at a single file"):
         _select_pdd_file(PDD_CKPT.parent)
@@ -560,7 +536,7 @@ def test_pdd_named_file_without_a_head_bank_raises_instead_of_falling_back(tmp_p
     wasted 3-minute request that returns garbage, not an error."""
     from safetensors.torch import save_file
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _PDD_VARIANTS_BY_NAME
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _PDD_VARIANTS_BY_NAME
 
     fake = tmp_path / _PDD_VARIANTS_BY_NAME["fl2va"].filename
     save_file({"transformer_blocks.0.attn.to_q.lora_down": torch.zeros(64, 5376)}, str(fake))
@@ -631,7 +607,7 @@ def test_trunk_binds_to_the_dit_that_serves_the_task(variant_name, partition, ta
     ``_transformer_for_task(task)`` hands to the denoise loop. Before the fix
     these diverged for ref2va on a combined server -- head bank on
     `transformers_ref`, trunk delta on `transformer`."""
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _PDD_VARIANTS_BY_NAME
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _PDD_VARIANTS_BY_NAME
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     variant = _PDD_VARIANTS_BY_NAME[variant_name]
@@ -645,7 +621,7 @@ def test_trunk_binds_to_the_dit_that_serves_the_task(variant_name, partition, ta
 def test_validate_pdd_sampling_rejects_a_task_the_artifact_was_not_distilled_for():
     from types import SimpleNamespace
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _PDD_VARIANTS_BY_NAME
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _PDD_VARIANTS_BY_NAME
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.errors import OmniClientError
 
@@ -682,7 +658,7 @@ def test_validate_pdd_sampling_rejects_a_non_unit_lora_scale():
     the requested scale."""
     from types import SimpleNamespace
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd import _PDD_VARIANTS_BY_NAME
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import _PDD_VARIANTS_BY_NAME
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.errors import OmniClientError
 
@@ -730,6 +706,9 @@ def test_manager_removal_releases_pdd_banks(evict):
     manager.max_cached_adapters = 1
     manager._registered_adapters = {1: SimpleNamespace(id=1)}
     manager._active_adapter_id = None
+    manager._suspended_adapter_id = None
+    manager._fixed_adapter_request = None
+    manager._merged_adapters = {}
     manager._adapter_scales = {1: 1.0}
     manager._adapter_access_order = OrderedDict([(1, 0)])
     manager._pinned_adapters = set()
@@ -741,6 +720,35 @@ def test_manager_removal_releases_pdd_banks(evict):
     assert not pipeline._pdd_adapters
     assert not pipeline._pdd_adapter_ids
     assert not manager._registered_adapters
+
+
+def test_manager_close_keeps_fixed_guard_and_releases_model_and_merged_banks():
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline._ensure_pdd_bookkeeping()
+    pipeline._pdd_adapters[1] = {"head_weights": torch.ones(1)}
+    pipeline._pdd_adapter_ids.add(1)
+    closed = []
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline, manager._closed = pipeline, False
+    manager._registered_adapters, manager._adapter_scales = {1: object()}, {1: 1.0}
+    manager._fixed_adapter_request = SimpleNamespace(lora_int_id=1)
+    manager._active_adapter_id = manager._suspended_adapter_id = None
+    manager._merged_adapters = {1: SimpleNamespace(close=lambda: closed.append(1))}
+    manager._lora_modules = {}
+    manager._adapter_access_order, manager._pinned_adapters = OrderedDict([(1, 0)]), {1}
+    assert manager.remove_adapter(1) is False
+    assert pipeline._pdd_adapters
+    manager.close()
+    assert closed == [1]
+    assert not manager._registered_adapters
+    assert not pipeline._pdd_adapters
+    assert not pipeline._pdd_adapter_ids
 
 
 @pytest.mark.parametrize("num_steps", [7, 9])
@@ -767,7 +775,7 @@ def test_validate_pdd_sampling_rejects_wrong_evaluation_count(num_steps):
 def test_pdd_sampling_preserves_the_distilled_euler_contract(sampler):
     from types import SimpleNamespace
 
-    from vllm_omni.diffusion.models.minimax_h3.pdd_lifecycle import MiniMaxH3PDDLifecycleMixin
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact_lifecycle import MiniMaxH3PDDLifecycleMixin
     from vllm_omni.errors import OmniClientError
 
     cfg = PDDConfig()

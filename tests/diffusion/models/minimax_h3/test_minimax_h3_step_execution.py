@@ -134,6 +134,27 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
+@pytest.mark.parametrize("steps", [(0,), (0, 7)])
+def test_pdd_step_execution_keeps_request_steps_without_backend_warning(steps, mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+    from vllm_omni.diffusion.models.minimax_h3.pdd import pdd_sigmas
+
+    model = mocker.Mock(wraps=_SegmentMeanModel())
+    pipeline = _step_pipeline(model)
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    warning = mocker.patch.object(mod.logger, "warning_once")
+    states = []
+    for index, step in enumerate(steps):
+        branch, video, audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=index)
+        state = _make_state(str(index), model, branch, video, audio, pdd_sigmas(12), pdd_sigmas(3))
+        state.step_index = step
+        states.append(state)
+    pipeline.denoise_step(None, states=states)
+    assert [call.kwargs["pdd_step"] for call in model.call_args_list] == list(steps)
+    warning.assert_not_called()
+
+
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
@@ -176,8 +197,9 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
 
 
 def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
-    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
     from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
     from vllm_omni.platforms import current_omni_platform
 
@@ -763,13 +785,13 @@ def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     assert not torch.equal(result_video, video)
 
 
-@pytest.mark.parametrize("execution", ["request", "step"])
+@pytest.mark.parametrize("execution", ["request", "step", "step_evicted"])
 def test_pdd_base_pdd_switch_at_execution_boundary(execution):
     """A base request after PDD must restore projections without manual disarm."""
     from contextlib import nullcontext
 
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
-    from vllm_omni.diffusion.models.minimax_h3.pdd import PDDAdapter, PDDConfig
+    from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import PDDAdapter, PDDConfig
 
     class HeadModel(_SegmentMeanModel):
         def __init__(self):
@@ -782,7 +804,11 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
         def __call__(self, **kwargs):
             self.evaluations += 1
             video, audio = super().__call__(**kwargs)
-            return self.final_layer.video_out(video)[0], self.final_layer.audio_out(audio)[0]
+            step, adapter_id = kwargs.get("pdd_step"), kwargs.get("pdd_adapter_id")
+            return (
+                self.final_layer.video_out(video, step, adapter_id)[0],
+                self.final_layer.audio_out(audio, step, adapter_id)[0],
+            )
 
     torch.manual_seed(42)
     model = HeadModel()
@@ -790,13 +816,19 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
     vp, ap = cfg.plans()
     adapter = PDDAdapter(config=cfg, lora_id=1, video_plans=vp, audio_plans=ap)
     adapter.install_heads(model)
-    with torch.no_grad():
-        for head in (model.final_layer.video_out, model.final_layer.audio_out):
-            head.weight.add_(0.01)
-            head.bias.add_(0.1)
+    weights, biases = {}, {}
+    for name in ("video_out", "audio_out"):
+        head = getattr(model.final_layer, name)
+        weights[name] = head.base_weight[None].repeat(32, 1, 1) + 0.01
+        biases[name] = head.base_bias[None].repeat(32, 1) + 0.1
+    adapter.load_head_bank(model, weights, biases)
     branch, video, audio = _make_branch(text_len=3, latent_t=1, latent_h=2, latent_w=2, audio_t=2, seed=5)
     sv, sa = _sigmas(8, 12.0), _sigmas(8, 3.0)
     pipeline = _step_pipeline(model)
+    pipeline._ensure_pdd_bookkeeping()
+    pipeline._pdd_adapters[1] = {"cfg": cfg, "head_weights": weights, "head_biases": biases}
+    pipeline._pdd_adapter_ids.add(1)
+    pipeline._pdd_active_adapters[1] = adapter
     pipeline._resident_dit_layers_on_device = lambda **kwargs: nullcontext()
     pipeline.progress_bar = lambda **kwargs: nullcontext(SimpleNamespace(update=lambda: None))
     pipeline._unpack_denoised_rows = lambda branch, v, a, **kwargs: (v, a)
@@ -840,6 +872,15 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
         while not state.denoise_completed:
             pred = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
             pipeline.step_scheduler(state, pred)
+            if execution == "step_evicted" and active is not None and state.step_index == 1:
+                # The worker can evict A while another wave uses B, then
+                # reload A's metadata without preparing A's cached state again.
+                pipeline._remove_diffusion_lora_adapter(1)
+                pipeline._pdd_adapters[2] = {"cfg": cfg, "head_weights": weights, "head_biases": biases}
+                pipeline._ensure_pdd_heads(2)
+                pipeline._remove_diffusion_lora_adapter(2)
+                pipeline._pdd_adapters[1] = {"cfg": cfg, "head_weights": weights, "head_biases": biases}
+                pipeline._pdd_adapter_ids.add(1)
         return state.latents, state.extra[mod._STEP_AUDIO_ROWS]
 
     assert len(sv) == len(sa) == 9
@@ -854,3 +895,31 @@ def test_pdd_base_pdd_switch_at_execution_boundary(execution):
     for expected, restored in zip(pdd_before, pdd_after):
         torch.testing.assert_close(expected, restored)
     assert not torch.allclose(base_before[0], pdd_before[0])
+
+
+def test_full_checkpoint_request_loop_keeps_pdd_steps():
+    """Adding artifact IDs must not change full-checkpoint explicit-step calls."""
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.pdd import pdd_sigmas
+
+    class FullCheckpointModel(_SegmentMeanModel):
+        arch = SimpleNamespace(pdd_steps=32)
+
+        def __call__(self, **kwargs):
+            assert kwargs["pdd_step"] == len(self.calls)
+            assert "pdd_adapter_id" not in kwargs
+            return super().__call__(**kwargs)
+
+    branch, video, audio = _make_branch(text_len=3, latent_t=1, latent_h=2, latent_w=2, audio_t=2, seed=5)
+    model = FullCheckpointModel()
+    minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=pdd_sigmas(12),
+        sigmas_audio=pdd_sigmas(3),
+        device=torch.device("cpu"),
+    )
+    assert len(model.calls) == 8

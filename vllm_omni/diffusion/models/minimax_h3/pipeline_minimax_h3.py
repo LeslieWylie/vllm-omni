@@ -124,7 +124,7 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
-from .fasth3_checkpoint import FastH3CheckpointSpec
+from .fasth3_checkpoint import FastH3CheckpointSpec, FastH3OmniCheckpointSpec
 from .latent_mask import (
     MiniMaxH3LatentEdit,
     minimax_h3_audio_edit_masks,
@@ -162,8 +162,8 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
-from .pdd import PDDAdapter, PDDConfig
-from .pdd_lifecycle import MiniMaxH3PDDLifecycleMixin
+from .pdd_artifact import PDDAdapter, PDDConfig
+from .pdd_artifact_lifecycle import MiniMaxH3PDDLifecycleMixin
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
@@ -252,7 +252,12 @@ def _resolve_minimax_h3_model_root(
             return path.parent
         return path
     if is_minimax_h3_modular(model, revision):
-        allow_patterns = ["modular_model_index.json", "fastvideo_inference.json", "provenance.json", "transformer/**"]
+        from vllm_omni.model_executor.models.minimax_h3.checkpoint import minimax_h3_transformer_subfolder
+
+        component = minimax_h3_transformer_subfolder(model=model, revision=revision)
+        allow_patterns = ["modular_model_index.json", "fastvideo_inference.json", "provenance.json", f"{component}/**"]
+        if component == "transformer_ref":
+            allow_patterns += ["vae_decoder_nvfp4/**", "vae_decoder_nvfp4_fast/**"]
         if load_text_encoder:
             allow_patterns += ["text_encoder/**", "tokenizer/**", "processor/**"]
     elif load_text_encoder:
@@ -647,6 +652,10 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    # DiT implementation constructed for the primary ``transformer``.
+    # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
+    # a derived pipeline may point this at a subclass.
+    _transformer_cls: ClassVar[type[MiniMaxH3DiTModel] | None] = None
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
@@ -706,7 +715,12 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("layerwise offload")
         offload_mode = " or ".join(offload_modes) or None
         pdd_loaded = self._load_pdd_lora_adapter(
-            lora_request=lora_request, lora_path=lora_path, dtype=dtype, unsupported_offload_mode=offload_mode
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=(
+                "DiT offload" if od_config is not None and resolved_offload.offloads(DIT_COMPONENT) else None
+            ),
         )
         if pdd_loaded is not None:
             return pdd_loaded
@@ -932,8 +946,6 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
-        if modular and str(od_config.task_type or "auto").lower() == "auto":
-            self.partition = "fl2va"
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
@@ -949,9 +961,16 @@ class MiniMaxH3Pipeline(
             self._fasth3_checkpoint = FastH3CheckpointSpec.from_metadata(
                 json.loads((model_root / "fastvideo_inference.json").read_text(encoding="utf-8"))
             )
+            if str(od_config.task_type or "auto").lower() == "auto":
+                self.partition = self._fasth3_checkpoint.partition
             self._fasth3_checkpoint.check_serving_contract(partition=self.partition, od_config=od_config)
             release = self._fasth3_checkpoint.release_metadata()
-            vae_model_path = self._fasth3_checkpoint.resolve_native_vaes(model_root)
+            if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
+                vae_model_path = self._fasth3_checkpoint.resolve_base_components(
+                    load_text_encoder=self.load_text_encoder and not (model_root / "text_encoder/config.json").is_file()
+                )
+            else:
+                vae_model_path = self._fasth3_checkpoint.resolve_native_vaes(model_root)
         else:
             model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
             model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
@@ -989,10 +1008,17 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
+        encoder_model_path = (
+            vae_model_path
+            if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
+            and not (model_path / "text_encoder/config.json").is_file()
+            else model_path
+        )
+        transformer_component = self._fasth3_checkpoint.transformer_component if modular else "transformer"
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=str(model_path),
-                subfolder="transformer",
+                subfolder=transformer_component,
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=False,
@@ -1014,15 +1040,56 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
-        self.transformer = MiniMaxH3DiTModel(
+        from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
+
+        if isinstance(transformer_quant_config, SerializedPerChannelFp8Config):
+            from .checkpoint_quantization import fasth3_fp8_config
+
+            transformer_quant_config = fasth3_fp8_config(model_path / transformer_component)
+        packed_dit = model_path / transformer_component / "nvfp4_weights.safetensors"
+        if packed_dit.is_file():
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            from .checkpoint_quantization import FastH3NVFP4Config
+            from .vae_nvfp4 import require_nvfp4_linear
+
+            require_nvfp4_linear(self.device)
+            if transformer_quant_config is not None:
+                raise ValueError("FastH3 QAD already contains NVFP4 weights; remove the quantization override")
+            transformer_quant_config = FastH3NVFP4Config.from_dit(packed_dit, rank=get_tensor_model_parallel_rank())
+            self.weights_sources.insert(
+                1,
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(model_path),
+                    subfolder=transformer_component,
+                    revision=od_config.revision,
+                    prefix="transformer.",
+                    fall_back_to_pt=False,
+                    allow_patterns_overrides=["nvfp4_weights.safetensors"],
+                ),
+            )
+        transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
         )
         if self._fasth3_checkpoint is not None:
-            self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)
+            spec = self._fasth3_checkpoint
+            if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
+                raise ValueError("FastH3 Omni transformer_ref/config.json must declare pdd_steps=32")
+            self.transformer.enable_vsa_gates(
+                sparsity=spec.vsa_sparsity,
+                tile_size=spec.vsa_tile_size,
+                ref_policy=spec.vsa_ref_policy,
+                ref_keep_rate=spec.vsa_ref_keep_rate,
+            )
             logger.info(
-                "FastH3 V2 full checkpoint: 8 transformer forwards, video/audio shifts 10/3, VSA sparsity=0.8 tile=64"
+                "%s: 8 forwards, video/audio shifts %s/3, VSA sparsity=%s tile=%s",
+                spec.name,
+                spec.video_shift,
+                spec.vsa_sparsity,
+                spec.vsa_tile_size,
             )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
@@ -1070,14 +1137,14 @@ class MiniMaxH3Pipeline(
 
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
-                str(model_path),
+                str(encoder_model_path),
                 subfolder="tokenizer",
-                local_files_only=os.path.isdir(model_path),
+                local_files_only=os.path.isdir(encoder_model_path),
             )
             self.processor = Qwen3VLProcessor.from_pretrained(
-                str(model_path),
+                str(encoder_model_path),
                 subfolder="processor",
-                local_files_only=os.path.isdir(model_path),
+                local_files_only=os.path.isdir(encoder_model_path),
             )
         else:
             self.tokenizer = None
@@ -1103,7 +1170,7 @@ class MiniMaxH3Pipeline(
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
             self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-                os.path.join(model_path, "text_encoder"),
+                os.path.join(encoder_model_path, "text_encoder"),
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
@@ -1112,7 +1179,7 @@ class MiniMaxH3Pipeline(
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(
-                        model_or_path=str(model_path),
+                        model_or_path=str(encoder_model_path),
                         subfolder="text_encoder",
                         revision=od_config.revision,
                         prefix="text_encoder.",
@@ -1140,6 +1207,12 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                decoder_source=(od_config.additional_config or {}).get(
+                    "video_vae_decoder",
+                    str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
+                    if (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
+                    else None,
+                ),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
@@ -1241,9 +1314,13 @@ class MiniMaxH3Pipeline(
             # close the adapter against what the DiT actually consumed.
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._fasth3_checkpoint is not None:
-            required_gates = {
-                f"blocks.{i}.attn.to_gate_compress.weight" for i in range(self.transformer.arch.num_layers)
-            }
+            parameter_names = set(dict(self.transformer.named_parameters()))
+            required_gates = set()
+            for i in range(self.transformer.arch.num_layers):
+                prefix = f"blocks.{i}.attn.to_gate_compress."
+                required_gates.update(
+                    {name for name in parameter_names if name.startswith(prefix)} or {prefix + "weight"}
+                )
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
         return loaded_with_prefix
@@ -2032,6 +2109,13 @@ class MiniMaxH3Pipeline(
                 audio_edit_restore_mask_rows,
             )
 
+        if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
+            from .pdd import pdd_sigmas
+
+            video_sigmas, audio_sigmas = pdd_sigmas(video_shift), pdd_sigmas(audio_shift)
+            # Only target rows are sampled from sigma_0 * N(0, I).
+            initial_video[branch.update_mask] *= video_sigmas[0]
+            initial_audio[branch.audio_update_mask] *= audio_sigmas[0]
         return {
             "branch": branch,
             # The request-mode loop moves these onto the device itself; step mode
@@ -2171,19 +2255,7 @@ class MiniMaxH3Pipeline(
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
         if pdd_adapter is not None:
-            # PDD: disable packed multi-request batching because different
-            # requests at different step indices need different fused heads
-            # (the plan is per-DiT-module, not per-row). Arming the head plan
-            # happens from a step_profiler context that fires just before each
-            # model forward.
-            def _pdd_arm(step_idx: int):
-                pdd_adapter.arm_step(transformer, step_idx)
-                return nullcontext()
-
-            step_profiler = _pdd_arm
-        else:
-            self._reset_pdd_heads(transformer)
-            step_profiler = None
+            self._ensure_pdd_heads(pdd_adapter.lora_id)
         # Each pass (including each output and hi-res refine) owns its cache.
         # Refine can change both the packed shape and the schedule length.
         registry = getattr(transformer, "_hook_registry", None)
@@ -2210,7 +2282,7 @@ class MiniMaxH3Pipeline(
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
                     on_step=lambda step, video, audio: progress.update(),
-                    step_profiler=step_profiler,
+                    pdd_adapter_id=None if pdd_adapter is None else pdd_adapter.lora_id,
                 )
 
         return self._unpack_denoised_rows(
@@ -2258,7 +2330,7 @@ class MiniMaxH3Pipeline(
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
-                dtype=torch.float16,
+                dtype=self.video_vae.decode_dtype,
                 enabled=True,
             ):
                 videos = decode_chunks_to_mp4(
@@ -2313,7 +2385,7 @@ class MiniMaxH3Pipeline(
         with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
-                dtype=torch.float16,
+                dtype=self.video_vae.decode_dtype,
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
@@ -3285,7 +3357,7 @@ class MiniMaxH3Pipeline(
         check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
         # ``pdd_adapter`` is not a _build_denoise_inputs argument -- it only
-        # steers the per-step head arming inside diffuse() -- so it rides
+        # selects artifact head banks during denoising -- so it rides
         # alongside the selected denoise kwargs rather than in them.
         denoise_kwargs["pdd_adapter"] = context.get("pdd_adapter")
         num_outputs = context["num_outputs"]
@@ -3600,30 +3672,16 @@ class MiniMaxH3Pipeline(
         }
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
 
-        # PDD safety: if any request in the batch is running PDD, fall back to
-        # one-forward-per-request so each request's plan can be armed
-        # independently.  The plan is a per-DiT-module state, so co-batching
-        # requests at different step indices (or PDD + non-PDD) would use the
-        # wrong fused head.  Request-mode (non-step) never reaches here -- it
-        # uses minimax_h3_denoise_loop directly with a step_profiler that arms
-        # the plan each iteration.
-        any_pdd = any(getattr(state, "extra", {}).get(_STEP_PDD_ADAPTER) is not None for state in batch_states)
-        if not any_pdd:
-            # Base-only batches may follow a completed PDD batch.
-            for transformer in transformers:
-                self._reset_pdd_heads(transformer)
-        # any_pdd forces the per-request loop even for a single request: that
-        # loop is the only path that calls arm_step before the forward, and a
-        # PDD head left on its default (un-armed) plan silently runs head 0
-        # for every step instead of the per-step fused bank.
-        if any_pdd or (
-            len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0]))
+        pdd = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
+        artifact_pdd = any(state.extra.get(_STEP_PDD_ADAPTER) is not None for state in batch_states)
+        if (
+            pdd
+            or artifact_pdd
+            or (len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])))
         ):
-            if any_pdd and not mixed_transformers:
-                logger.warning_once(
-                    "MiniMax H3 step batching is disabled while PDD acceleration is active: "
-                    "PDD fused heads are per-step per-request state and cannot be co-batched. "
-                    "Running %d requests one forward at a time.",
+            if pdd or artifact_pdd:
+                logger.debug(
+                    "MiniMax H3 PDD executes %d request(s) separately with request-local step indices.",
                     len(batch_states),
                 )
             elif mixed_transformers:
@@ -3653,13 +3711,7 @@ class MiniMaxH3Pipeline(
             video_parts: list[torch.Tensor] = []
             audio_parts: list[torch.Tensor] = []
             for index, branch in enumerate(branches):
-                # Arm the PDD plan for this request's current step *before* its forward.
                 pdd_adapter = batch_states[index].extra.get(_STEP_PDD_ADAPTER)
-                if pdd_adapter is not None:
-                    pdd_adapter.arm_step(transformers[index], batch_states[index].step_index)
-                elif any_pdd:
-                    # A preceding PDD row may have armed this same DiT.
-                    self._reset_pdd_heads(transformers[index])
                 forward_kwargs = branch.forward_kwargs(
                     video_rows=video_rows[index],
                     audio_rows=audio_rows[index],
@@ -3670,6 +3722,14 @@ class MiniMaxH3Pipeline(
                     video_target_timesteps=video_target_timesteps[index],
                     audio_target_timesteps=audio_target_timesteps[index],
                 )
+                if pdd or pdd_adapter is not None:
+                    forward_kwargs["pdd_step"] = int(batch_states[index].step_index)
+                if pdd_adapter is not None:
+                    # Cached step requests can outlive LRU eviction. The
+                    # worker has reloaded this request's trunk by this point;
+                    # reinstall its model-owned banks too.
+                    self._ensure_pdd_heads(pdd_adapter.lora_id)
+                    forward_kwargs["pdd_adapter_id"] = pdd_adapter.lora_id
                 request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
                 audio_parts.append(request_audio)
