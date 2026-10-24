@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
         pytest.param(
             "cuda",
             marks=[
-                pytest.mark.cuda,
+                *hardware_marks(res={"cuda": "L4"}, num_cards=1),
                 pytest.mark.skipif(
                     not current_omni_platform.is_cuda() or not HAS_TRITON, reason="CUDA/Triton required"
                 ),
@@ -55,7 +55,7 @@ def test_indexed_scale_shift_to_fp32_matches_two_launch_path(device, dtype, rows
     assert torch.equal(x, before)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda() or not HAS_TRITON, reason="CUDA/Triton required")
 def test_indexed_scale_shift_to_fp32_retains_bf16_rounding() -> None:
     x = torch.full((2, 5376), 1.125, device="cuda", dtype=torch.bfloat16)
