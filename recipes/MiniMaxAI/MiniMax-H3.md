@@ -108,6 +108,11 @@ Cached artifact banks consume resident FP32 memory until adapter eviction or
 manager close. A scheduled batch still shares the worker's existing LoRA key;
 different trunk adapters are not combined into one batch.
 
+Use separate workers for PDD and generic PEFT adapters targeting the same
+DiT's `final_layer.video_out` or `audio_out`. Their output-layer wrappers are
+incompatible in either loading order, including after adapter eviction. Native
+and Turbo adapters do not target these projections and retain their normal path.
+
 The published `alibaba-pai/MiniMax-H3-Acc-LoRAs` adapters use 32 distilled
 heads fused into eight denoising evaluations. The API requires **8 denoiser evaluations** (`num_inference_steps=8`),
 which are bounded by 9 internal sigma points, video shift 12, audio shift 3, and

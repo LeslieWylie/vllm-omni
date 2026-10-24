@@ -12,7 +12,13 @@ import torch
 
 from vllm_omni.errors import OmniClientError
 
-from .pdd_artifact import PDDAdapter, PDDConfig, load_minimax_h3_pdd_lora
+from .pdd_artifact import (
+    PDDAdapter,
+    PDDConfig,
+    PDDParallelHead,
+    _validate_pdd_head_replacement,
+    load_minimax_h3_pdd_lora,
+)
 from .sampling import normalize_h3_sampler
 
 if TYPE_CHECKING:
@@ -54,7 +60,6 @@ class MiniMaxH3PDDLifecycleMixin:
         unsupported_offload_mode: str | None,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
         self._ensure_pdd_bookkeeping()
-        self._remove_diffusion_lora_adapter(lora_request.lora_int_id)
         # Try PDD first: the PDD loader raises if the path names the PDD
         # artifact but its contents are malformed, and returns None for a
         # non-PDD path so turbo / generic PEFT get their chance.
@@ -65,16 +70,39 @@ class MiniMaxH3PDDLifecycleMixin:
             dtype=dtype,
             unsupported_offload_mode=unsupported_offload_mode,
         )
-        if pdd_loaded is not None:
-            lora_model, peft_helper, pdd_cfg, head_weights, head_biases = pdd_loaded
-            self._pdd_adapters[lora_request.lora_int_id] = {
-                "cfg": pdd_cfg,
-                "head_weights": head_weights,
-                "head_biases": head_biases,
-            }
-            self._pdd_adapter_ids.add(lora_request.lora_int_id)
-            return lora_model, peft_helper
-        return None
+        if pdd_loaded is None:
+            self._remove_diffusion_lora_adapter(lora_request.lora_int_id)
+            return None
+        lora_model, peft_helper, pdd_cfg, head_weights, head_biases = pdd_loaded
+        dit = getattr(self, pdd_cfg.dit_component, None)
+        if dit is not None:
+            _validate_pdd_head_replacement(dit)
+        # A rejected load must not discard an existing classification/bank.
+        self._remove_diffusion_lora_adapter(lora_request.lora_int_id)
+        self._pdd_adapters[lora_request.lora_int_id] = {
+            "cfg": pdd_cfg,
+            "head_weights": head_weights,
+            "head_biases": head_biases,
+        }
+        self._pdd_adapter_ids.add(lora_request.lora_int_id)
+        return lora_model, peft_helper
+
+    def _validate_diffusion_lora_activation(self, *, lora_model: LoRAModel) -> None:
+        """Reject head LoRAs before activation can modify any live adapter."""
+        for component in ("transformer", "transformers_ref"):
+            dit = getattr(self, component, None)
+            layer = getattr(dit, "final_layer", None)
+            for name in ("video_out", "audio_out"):
+                if not isinstance(getattr(layer, name, None), PDDParallelHead):
+                    continue
+                # Match the manager's full, component-relative and leaf lookup.
+                candidates = (f"{component}.final_layer.{name}", f"final_layer.{name}", name)
+                if any(lora_model.get_lora(candidate) is not None for candidate in candidates):
+                    raise ValueError(
+                        "Generic PEFT LoRA targeting "
+                        f"{component}.final_layer.{name} cannot run with Alibaba PDD heads; "
+                        "use separate workers for PDD and generic final-projection adapters."
+                    )
 
     def _validate_pdd_lora_binding(self, *, lora_model: LoRAModel, bound_lora_names: frozenset[str]) -> bool:
         """Validate PDD trunk targets; return whether this is a PDD adapter."""

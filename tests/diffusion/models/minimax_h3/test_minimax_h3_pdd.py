@@ -380,7 +380,6 @@ def test_load_minimax_h3_pdd_lora_accepts_combined_partition():
     assert loaded is not None
 
 
-@pytest.mark.skipif(not PDD_CKPT.is_file(), reason="PDD checkpoint not present")
 def test_load_minimax_h3_pdd_lora_returns_none_for_non_pdd_path(tmp_path):
     # A path that doesn't contain the PDD filename returns None (PEFT fallback).
     assert (

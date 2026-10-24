@@ -1092,6 +1092,11 @@ class DiffusionLoRAManager:
         logger.debug("Published MoE LoRA context on %d wrapper(s)", len(moe_wrappers))
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        # Validate before fast paths or state changes: rejection must preserve
+        # the currently active adapter and must not reset its live buffers.
+        validate_activation = getattr(self.pipeline, "_validate_diffusion_lora_activation", None)
+        if callable(validate_activation):
+            validate_activation(lora_model=self._registered_adapters[adapter_id])
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
             return

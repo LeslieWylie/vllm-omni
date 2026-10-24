@@ -21,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
@@ -600,6 +601,19 @@ def _pack_pdd_fc1(lora_model: LoRAModel) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _validate_pdd_head_replacement(transformer: nn.Module) -> None:
+    if getattr(getattr(transformer, "arch", None), "pdd_steps", None) is not None:
+        raise ValueError("Alibaba PDD adapters cannot replace FastH3 Omni checkpoint heads")
+    # Check both projections before replacing either. The manager retains LoRA
+    # wrappers after eviction and would otherwise bind a detached projection.
+    for name in ("video_out", "audio_out"):
+        if isinstance(getattr(transformer.final_layer, name), BaseLayerWithLoRA):
+            raise ValueError(
+                "Alibaba PDD cannot replace final projections already wrapped for generic PEFT LoRA "
+                f"({name}); use separate workers for PDD and generic final-projection adapters."
+            )
+
+
 @dataclass
 class PDDAdapter:
     """Request descriptor for an artifact's task, ID and integration plans."""
@@ -610,8 +624,7 @@ class PDDAdapter:
     audio_plans: torch.Tensor
 
     def install_heads(self, transformer: nn.Module) -> None:
-        if getattr(getattr(transformer, "arch", None), "pdd_steps", None) is not None:
-            raise ValueError("Alibaba PDD adapters cannot replace FastH3 Omni checkpoint heads")
+        _validate_pdd_head_replacement(transformer)
         layer = transformer.final_layer
         for name in ("video_out", "audio_out"):
             head = getattr(layer, name)
