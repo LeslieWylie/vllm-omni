@@ -229,25 +229,26 @@ def from_layer_diffusion(
     return layer
 
 
-def validate_generic_peft_ranks(loras: Mapping[str, LoRALayerWeights]) -> None:
-    """Check raw 2D factors against each layer's already-resolved PEFT rank.
+def validate_generic_peft_ranks(loras: Mapping[str, LoRALayerWeights], max_lora_rank: int) -> None:
+    """Check raw 2D factor compatibility and the planned wrapper capacity.
 
-    LoRAModel resolves rank/alpha patterns before this check. Keep its rank and
-    scaling intact; non-2D fused tensors retain the existing loader checks.
+    The physical rank can differ from PEFT metadata when both factors agree
+    and fit the zero-padded buffers. Keep the loader's resolved rank/scaling;
+    non-2D fused tensors retain the existing loader checks.
     """
     mismatched = []
     for name, weights in loras.items():
         a, b = weights.lora_a, weights.lora_b
         if a is None or b is None or a.ndim != 2 or b.ndim != 2:
             continue
-        if a.shape[0] != weights.rank or b.shape[1] != weights.rank:
+        if a.shape[0] != b.shape[1] or a.shape[0] > max_lora_rank:
             mismatched.append(
-                f"{name} (resolved rank={weights.rank}, lora_A rows={a.shape[0]}, lora_B columns={b.shape[1]})"
+                f"{name} (lora_A rows={a.shape[0]}, lora_B columns={b.shape[1]}, buffer capacity={max_lora_rank})"
             )
     if mismatched:
         detail = "; ".join(mismatched[:8])
         raise ValueError(
-            "LoRA factors do not match their resolved PEFT ranks: "
+            "Incompatible LoRA factors: "
             f"{detail}. Supply matching weights or a model-specific "
             "_load_diffusion_lora_adapter hook for nonstandard layouts."
         )
