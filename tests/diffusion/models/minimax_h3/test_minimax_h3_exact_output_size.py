@@ -61,6 +61,8 @@ def test_disaggregated_decoder_preserves_center_crop(height, width, preencode, m
 
     def decode(video, audio, **kwargs):
         received.append(kwargs)
+        if preencode:
+            kwargs["frame_counts"].append(4)
         return b"mp4" if preencode else (torch.zeros(1, 3, 1, 2, 2), audio)
 
     decoder.decode = decode
@@ -68,9 +70,12 @@ def test_disaggregated_decoder_preserves_center_crop(height, width, preencode, m
     decoder._offload_model_cpu_stage_output = lambda video: video
     decoder._release_stage_cache = lambda: None
     monkeypatch.setattr(decoder_module, "get_minimax_h3_post_process_func", lambda config: None)
-    decoder.forward(request)
+    output = decoder.forward(request)
     assert len(received) == 1
     assert (received[0]["height"], received[0]["width"], received[0]["crop_offset"]) == (height, width, offset)
+    if preencode:
+        assert output.output.video == b"mp4"
+        assert output.output.frame_counts == [4]
 
 
 @pytest.mark.parametrize("height,width,canvas", [(1080, 1920, (1088, 1920)), (1920, 1080, (1920, 1088))])
