@@ -350,7 +350,8 @@ class ChunkedVideoMP4Session:
     silent entry), so a caller with several outputs per prompt repeats a
     request's waveform across its entries. ``batch_frames`` coalesces transfers
     for producers that publish finer than a transfer is worth; ``crop`` trims
-    the decoder's padding to the requested output size. ``transfer_slots`` sets
+    the decoder's padding to the requested output size, and ``skip_frames``
+    drops leading frames a producer decodes only as context. ``transfer_slots`` sets
     how many chunks may be in flight to the host at once, while
     ``max_pending_bytes`` bounds their combined uint8 payload size.
     """
@@ -369,9 +370,12 @@ class ChunkedVideoMP4Session:
         crop_offset: tuple[int, int] = (0, 0),
         transfer_slots: int = 2,
         max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
+        skip_frames: int = 0,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
+        if skip_frames < 0:
+            raise ValueError("skip_frames must be non-negative")
         if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
             raise ValueError("max_pending_bytes must be a positive integer or None")
         self._value_range = value_range
@@ -387,6 +391,7 @@ class ChunkedVideoMP4Session:
         if crop is None and crop_offset != (0, 0):
             raise ValueError("crop_offset requires crop dimensions")
         self._crop_offset = crop_offset
+        self._skip_frames = skip_frames
         self._transfer_slots = transfer_slots
         self._max_pending_bytes = max_pending_bytes
         self._encoders: list[ChunkedMP4Encoder] = []
@@ -432,6 +437,12 @@ class ChunkedVideoMP4Session:
             if top + height > chunk.shape[-2] or left + width > chunk.shape[-1]:
                 raise ValueError("crop rectangle exceeds the decoded chunk")
             chunk = chunk[..., top : top + height, left : left + width]
+        if self._skip_frames:
+            skipped = min(self._skip_frames, int(chunk.shape[2]))
+            self._skip_frames -= skipped
+            chunk = chunk[:, :, skipped:]
+            if not chunk.shape[2]:
+                return
         self._pending.append(chunk)
         self._pending_frames += int(chunk.shape[2])
         if self._pending_frames >= self._batch_frames:

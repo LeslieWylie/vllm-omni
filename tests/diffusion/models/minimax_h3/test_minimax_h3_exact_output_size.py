@@ -101,6 +101,7 @@ def test_exact_canvas_rounds_up_and_default_retains_round_down(height, width, ca
         (1080, 1920, {"latent_refine": {}}),
         (1080, 1920, {"latent_upscale": True}),
         (1080, 1920, {"long_video_mode": "continuation"}),
+        (1080, 1920, {"continue_from": "previous-job"}),
         (1080, 1920, {"exact_output_size": "true"}),
     ],
 )

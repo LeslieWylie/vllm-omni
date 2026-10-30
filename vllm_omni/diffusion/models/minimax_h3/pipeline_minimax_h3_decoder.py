@@ -18,6 +18,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_partition
 
+from .latent_cache import trim_decoded_overlap
 from .pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
     _MiniMaxH3EncodedOutput,
@@ -122,6 +123,7 @@ class MiniMaxH3DecoderPipeline(
                         batch_frames=payload["preencode_batch_frames"],
                         crop_offset=payload.get("crop_offset", (0, 0)),
                         frame_counts=frame_counts,
+                        trim=payload.get("trim"),
                     )
                 )
                 audios.append(None)
@@ -133,6 +135,9 @@ class MiniMaxH3DecoderPipeline(
                     width=payload["width"],
                     crop_offset=payload.get("crop_offset", (0, 0)),
                 )
+                if payload.get("trim") is not None:
+                    # A continuation's hidden overlap was decoded only as causal context.
+                    video, audio = trim_decoded_overlap(video, audio, **payload["trim"])
                 video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 audios.append(audio)
