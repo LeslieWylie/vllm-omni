@@ -78,8 +78,10 @@ copying into separate padded buffers; equal-valued tensors do not establish
 sharing. Each slice retains its own B, scale and output accumulation.
 Replacement, reset and failed uploads discard the previous provenance.
 
-Gradient-enabled execution, compilation, CUDA Graph capture, fully sharded
-LoRA and other wrapper or device types retain per-slice shrink projections.
+Gradient-enabled execution, LoRA traced by `torch.compile`, CUDA Graph capture,
+fully sharded LoRA and other wrapper or device types retain per-slice shrink
+projections. If compilation leaves LoRA in an eager graph break, that eager
+call can still reuse a shared projection.
 In particular, captured graphs keep independent A reads so replacing a shared-A
 adapter with distinct factors does not introduce a new capture-topology
 assumption. No activation is cached across forward calls.
