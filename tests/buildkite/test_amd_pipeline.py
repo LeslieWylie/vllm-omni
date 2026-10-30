@@ -3503,3 +3503,90 @@ def test_verl_generate_ready_pins_the_mi325_node() -> None:
     assert "children(recursive=True)" in server
     assert "psutil.wait_procs" in shutdown
     assert "multiprocessing.active_children" not in server
+
+
+_TINY_DIFFUSION_BASE_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
+_TINY_DIFFUSION_BASE_NODES = (
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[AnimaPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2KleinPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[cpu_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[layerwise_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+cpu_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+layerwise_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImagePipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[LongCatImagePipeline[tea_cache]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[LongCatImageEditPipeline[tea_cache]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[Flux2Pipeline[cache_dit+layerwise_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPlusPipeline]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks["
+    "StableDiffusion3Pipeline[cache_dit+layerwise_offload]]",
+    "tests/model_tests/diffusion/test_common_offline.py::"
+    "test_pipeline_on_supported_tasks[StableDiffusionXLPipeline[cpu_offload]]",
+    "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[AnimaPipeline]",
+    "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[Flux2KleinPipeline]",
+    "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImagePipeline]",
+    "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPipeline]",
+    "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPlusPipeline]",
+)
+
+
+def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
+    """READY fail-closes on the one-card tiny-diffusion node ids.
+
+    The ids are the pytest.param ids from the single-device branch. Local
+    collection did not import the real modules (vllm RequestError / vllm._C).
+    LTX2 stays unmarked. One-card acceleration groups on that branch are
+    included; multi-GPU full_model groups are not.
+    """
+    step = _find_step("ROCm · Tiny Diffusion Base GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    body = command.split("nodes=(", 1)[1].split(")", 1)[0]
+    quoted = tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert step["timeout_in_minutes"] == 60
+    assert step["artifact_paths"] == ["artifacts/rocm-tiny-diffusion-base/**/*"]
+    assert "timeout --signal=TERM --kill-after=1m 50m" in command
+    assert "timeout 60m" not in command
+    assert _marker_expressions(step) == [
+        _TINY_DIFFUSION_BASE_MARKER,
+        _TINY_DIFFUSION_BASE_MARKER,
+    ]
+    assert command.count('--run-level "core_model"') == 2
+    assert command.count('"$${nodes[@]}"') == 3
+    assert "pytest -n" not in command
+    assert "-n 4" not in command
+    assert "VLLM_ROCM_USE_AITER=0" not in command
+    assert "LTX2" not in command
+    assert "full_model" not in "\n".join(_marker_expressions(step))
+    assert "tests/distributed" not in command
+    assert quoted == _TINY_DIFFUSION_BASE_NODES
+    assert len(quoted) == 22
+    offline = [node for node in quoted if "test_common_offline.py::" in node]
+    online = [node for node in quoted if "test_common_online.py::" in node]
+    assert len(offline) == 17
+    assert len(online) == 5
+    assert "diff -u /tmp/tiny-diffusion-base-ready-expected.txt" in command
+    assert "--junitxml=" in command
+
+    nightly = _find_step(
+        "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
+        AMD_NIGHTLY_PIPELINE,
+    )
+    assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
