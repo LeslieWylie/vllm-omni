@@ -69,6 +69,21 @@ upstream WTE can track layer completion and preserve live storage. See the
 [weight-transfer contract](../../feature/weight_transfer.md#diffusion-loading-contract)
 for support limits and validation requirements.
 
+## Shared factors in packed LoRA
+
+Merged-column diffusion LoRA layers can reuse a shrink projection within one
+CPU or CUDA eager inference call when the loader passes the same A tensor
+object for multiple active slices. Upload records this provenance before
+copying into separate padded buffers; equal-valued tensors do not establish
+sharing. Each slice retains its own B, scale and output accumulation.
+Replacement, reset and failed uploads discard the previous provenance.
+
+Gradient-enabled execution, compilation, CUDA Graph capture, fully sharded
+LoRA and other wrapper or device types retain per-slice shrink projections.
+In particular, captured graphs keep independent A reads so replacing a shared-A
+adapter with distinct factors does not introduce a new capture-topology
+assumption. No activation is cached across forward calls.
+
 ## Exact conditioning projection reuse
 
 Models with repeated conditioning projections can use `ExactProjectionCache`

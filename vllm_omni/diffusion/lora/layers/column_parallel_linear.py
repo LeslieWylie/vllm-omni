@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -34,7 +34,9 @@ class DiffusionMergedColumnParallelLinearWithLoRA(
     Prioritize apply() in DiffusionBaseLinearLayerWithLoRA
     """
 
-    pass
+    # MergedColumnParallelLinearWithLoRA.slice_lora_a returns A unchanged;
+    # TP partitions only B. Other packed wrappers keep the conservative path.
+    _diffusion_lora_share_a = True
 
 
 class DiffusionQKVParallelLinearWithLoRA(

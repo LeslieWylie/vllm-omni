@@ -7,8 +7,10 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
+from vllm_omni.diffusion.lora.layers.column_parallel_linear import DiffusionMergedColumnParallelLinearWithLoRA
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -295,3 +297,106 @@ def test_diffusion_base_linear_apply_respects_inactive_slices():
     # Only the first slice should be adapted.
     expected = torch.tensor([[2.0, 4.0, 3.0]])
     assert torch.allclose(out, expected)
+
+
+def _shared_a_layer(tp_size: int = 1):
+    """Exercise the real merged-column upload, including rank padding and TP B slicing."""
+    layer = DiffusionMergedColumnParallelLinearWithLoRA.__new__(DiffusionMergedColumnParallelLinearWithLoRA)
+    torch.nn.Module.__init__(layer)
+    layer.tp_size = tp_size
+    layer.n_slices = 2
+    layer.lora_config = _DummyLoRAConfig()
+    layer.output_slices = (3, 2)
+    layer.output_sizes = tuple(size * tp_size for size in layer.output_slices)
+    layer.output_ids = (tp_size - 1,) * 2
+    layer.lora_a_stacked = tuple(torch.zeros(1, 1, 4, 3) for _ in range(2))
+    layer.lora_b_stacked = tuple(torch.zeros(1, 1, size, 4) for size in layer.output_slices)
+    layer.base_layer = torch.nn.Module()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.arange(15).reshape(5, 3).float() / 8)
+    a = torch.tensor([[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]])
+    b = [torch.arange(size * 2).reshape(size, 2).float() / 8 for size in layer.output_sizes]
+    return layer, a, b
+
+
+class _ShrinkCounter(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if str(func).startswith("aten.mm.") and args[1].shape == (3, 4):
+            self.calls += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("shared", [True, False])
+def test_shared_a_shrink_preserves_padded_rank_and_tp_slices(tp_size, shared):
+    layer, a, b = _shared_a_layer(tp_size)
+    layer.set_lora(0, [a, a if shared else a.clone()], b)
+    assert layer._diffusion_lora_a_sources == ((0, 0) if shared else ())
+    x = torch.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]])
+    # The old path remains the oracle; no tensor storage is shared after upload.
+    assert layer.lora_a_stacked[0].data_ptr() != layer.lora_a_stacked[1].data_ptr()
+    sources = layer._diffusion_lora_a_sources
+    layer._diffusion_lora_a_sources = ()
+    with torch.no_grad():
+        expected = layer.apply(x)
+        layer._diffusion_lora_a_sources = sources
+        with _ShrinkCounter() as counter:
+            actual = layer.apply(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert counter.calls == (1 if shared else 2)
+    assert torch.count_nonzero(layer.lora_a_stacked[0][0, 0, 2:]) == 0
+    for uploaded, source, size in zip(layer.lora_b_stacked, b, layer.output_slices):
+        start = (tp_size - 1) * size
+        torch.testing.assert_close(uploaded[0, 0, :, :2], source[start : start + size])
+
+
+def test_shared_a_provenance_is_rebuilt_on_replace_and_reset():
+    layer, a, b = _shared_a_layer()
+    layer.set_lora(0, [a, a], b)
+    assert layer._diffusion_lora_a_sources == (0, 0)
+    layer.suspend_lora()
+    with torch.no_grad(), _ShrinkCounter() as counter:
+        layer.apply(torch.ones(1, 3))
+    assert counter.calls == 0
+    layer.resume_lora()
+    assert layer._diffusion_lora_a_sources == (0, 0)
+    layer.set_lora(0, [a, a.clone() + 1], b)
+    assert layer._diffusion_lora_a_sources == ()
+    with torch.no_grad(), _ShrinkCounter() as counter:
+        layer.apply(torch.ones(1, 3))
+    assert counter.calls == 2
+    layer.set_lora(0, [a, a], b)
+    layer.reset_lora(0)
+    assert layer._diffusion_lora_a_sources == ()
+    with torch.no_grad(), _ShrinkCounter() as counter:
+        layer.apply(torch.ones(1, 3))
+    assert counter.calls == 0
+
+
+@pytest.mark.parametrize("compiling", [False, True])
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_shared_a_shrink_keeps_compiled_and_grad_paths_unchanged(monkeypatch, compiling, grad_enabled):
+    layer, a, b = _shared_a_layer()
+    layer.set_lora(0, [a, a], b)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+    with torch.set_grad_enabled(grad_enabled), _ShrinkCounter() as counter:
+        layer.apply(torch.ones(1, 3))
+    assert counter.calls == (2 if compiling or grad_enabled else 1)
+
+
+def test_shared_a_failed_upload_discards_old_provenance(monkeypatch):
+    from vllm.lora.layers.column_parallel_linear import MergedColumnParallelLinearWithLoRA
+
+    layer, a, b = _shared_a_layer()
+    layer.set_lora(0, [a, a], b)
+
+    def fail_upload(*args, **kwargs):
+        raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(MergedColumnParallelLinearWithLoRA, "set_lora", fail_upload)
+    with pytest.raises(RuntimeError, match="upload failed"):
+        layer.set_lora(0, [a, a.clone()], b)
+    assert layer._diffusion_lora_a_sources == ()

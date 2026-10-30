@@ -27,6 +27,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
 
     # Mask saved while the adapter is suspended; None means "not suspended".
     _diffusion_lora_suspended_slices: tuple[bool, ...] | None = None
+    # Only wrappers that preserve A across their packed TP slices opt in.
+    _diffusion_lora_share_a: bool = False
+    _diffusion_lora_a_sources: tuple[int, ...] = ()
 
     def _move_lora_buffers(self, device: torch.device) -> None:
         self.lora_a_stacked = tuple(tensor.to(device=device) for tensor in self.lora_a_stacked)
@@ -59,8 +62,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
         self._diffusion_lora_suspended_slices = None
         self._diffusion_lora_epilogue_scale: float | None = None
+        self._diffusion_lora_a_sources = ()
 
     def reset_lora(self, index: int):
+        self._diffusion_lora_a_sources = ()
         super().reset_lora(index)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
@@ -74,6 +79,8 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         lora_a: torch.Tensor | list[torch.Tensor | None],
         lora_b: torch.Tensor | list[torch.Tensor | None],
     ):
+        # Clear provenance before upload, including an upload that fails.
+        self._diffusion_lora_a_sources = ()
         super().set_lora(index, lora_a, lora_b)  # type: ignore[arg-type]
 
         n_slices = getattr(self, "n_slices", 1)
@@ -89,6 +96,33 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         else:
             # Single-slice layer.
             self._diffusion_lora_active_slices = (True,)
+
+        if (
+            self._diffusion_lora_share_a
+            and index == 0
+            and isinstance(lora_a, list)
+            and len(lora_a) == n_slices
+            and not self.lora_config.fully_sharded_loras
+        ):
+            # Packed/fused loaders pass the same A object for shared factors.
+            # Record this before the source tensors are copied into independent
+            # padded buffers. Equal values or coincident storage are not proof.
+            sources = list(range(n_slices))
+            for i, a_i in enumerate(lora_a):
+                if not self._diffusion_lora_active_slices[i]:
+                    continue
+                for j in range(i):
+                    if (
+                        self._diffusion_lora_active_slices[j]
+                        and a_i is lora_a[j]
+                        and self.lora_a_stacked[i].shape == self.lora_a_stacked[j].shape
+                        and self.lora_a_stacked[i].stride() == self.lora_a_stacked[j].stride()
+                        and self.lora_a_stacked[i].dtype == self.lora_a_stacked[j].dtype
+                    ):
+                        sources[i] = sources[j]
+                        break
+            if any(i != source for i, source in enumerate(sources)):
+                self._diffusion_lora_a_sources = tuple(sources)
 
     def suspend_lora(self) -> None:
         """Gate every slice off without dropping the uploaded weights.
@@ -159,6 +193,19 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 f"lora_b_stacked={len(self.lora_b_stacked)}"
             )
 
+        # Raw graphs may outlive the uploaded adapter topology. Keep their
+        # original per-slice reads, and let compiled paths keep their own graph.
+        sources = (
+            self._diffusion_lora_a_sources if not torch.is_grad_enabled() and not torch.compiler.is_compiling() else ()
+        )
+        if sources:
+            if x.is_cuda:
+                if torch.get_device_module(x.device).is_current_stream_capturing():
+                    sources = ()
+            elif x.device.type != "cpu":
+                sources = ()
+        # Activations are retained only within this eager inference call.
+        shrink_buffers: dict[int, torch.Tensor] = {}
         offset = 0
         for slice_idx, slice_size in enumerate(output_slices):
             if active_slices is not None and slice_idx < len(active_slices) and not active_slices[slice_idx]:
@@ -176,7 +223,13 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
             epilogue_scale = getattr(self, "_diffusion_lora_epilogue_scale", None)
-            buffer = (x_flat if epilogue_scale is None else x_flat.to(A.dtype)) @ A.t()
+            source = sources[slice_idx] if sources else slice_idx
+            if sources and source in shrink_buffers:
+                buffer = shrink_buffers[source]
+            else:
+                buffer = (x_flat if epilogue_scale is None else x_flat.to(A.dtype)) @ A.t()
+                if sources:
+                    shrink_buffers[source] = buffer
             y_slice = y_flat[:, offset : offset + slice_size]
 
             # In inference, accumulate the expand GEMM directly into the base
