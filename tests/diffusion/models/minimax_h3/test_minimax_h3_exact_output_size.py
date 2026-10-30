@@ -132,6 +132,7 @@ def test_tensor_and_chunked_mp4_use_the_same_center_crop(height, width):
 
     class VideoVAE:
         decoder_component = None
+        decode_dtype = torch.float16
 
         def decode_latent(self, latent):
             return latent
